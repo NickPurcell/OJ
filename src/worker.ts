@@ -672,30 +672,46 @@ type SpawnOutcome = {
 /**
  * Permission settings for a reviewer.
  *
- * A code reviewer has no business editing the code it reviews, but it cannot be
- * made read-only either: it has to write its report, and a mode that forbids
- * all writes would have it complete the whole review and then be unable to hand
+ * A code reviewer has no business editing the code it reviews, but it cannot
+ * be made read-only either: it has to write its report, and a mode forbidding
+ * all writes would have it complete the whole review and be unable to hand
  * over the result.
  *
- * So the rule is narrower than any single permission mode expresses — write
- * exactly one file, read anything, change nothing. `--permission-mode auto`
- * keeps the session from stopping to ask a question nobody is there to answer;
- * these rules are what actually constrain it.
+ * The first attempt at that expressed the rule as `allow: Write(<report>)`
+ * plus `deny: Write(*), Edit(*)`. On 2026-08-10 the first real review ran for
+ * sixteen minutes and returned `no-report`. Three things were wrong, and they
+ * were established by running claude against these settings rather than by
+ * reading about them:
  *
- * The deny list names the ways a review turns into a mutation: editing the
- * tree, committing, pushing, rewriting history, or reaching for the `gh` CLI,
- * which would be an unexpected second path to GitHub with credentials of its
- * own. Deny beats allow in Claude Code's permission model, so these hold even
- * though the mode is permissive.
+ *   1. `Write(<path>)` allow rules are not matched by file permission checks
+ *      at all. Claude Code says so directly: "only Edit(path) rules are. Use
+ *      Edit(path) instead (Edit rules cover all file-editing tools)."
+ *
+ *   2. `deny: Write(*)` does not scope the Write tool — it removes it from the
+ *      session. The worker reported "The Write tool isn't available in this
+ *      session", finished its review, and had nothing to write the report
+ *      with. It then exited 0, because from its side nothing had failed.
+ *
+ *   3. `deny: Edit(*)` does not restrict paths. With it set, a write to an
+ *      unrelated file succeeded. Those denies were decorative, and their only
+ *      real effect was breaking the one operation that mattered.
+ *
+ * So: one `Edit()` allow for the report, and no blanket file denies. The
+ * reviewer can edit the clone, which is acceptable because the clone is reset
+ * from git at the start of every round and deleted when the pull request
+ * closes — the tree was never trusted between rounds anyway.
+ *
+ * The Bash denies are kept because those were tested and DO hold: a denied
+ * `git push` came back "Blocked — the permission system denied the call". They
+ * are the rules that stop a review becoming a mutation, and they work.
  */
 function workerPermissionSettings(reportPath: string): string {
   return JSON.stringify({
     permissions: {
-      allow: [`Write(${reportPath})`, `Edit(${reportPath})`],
+      // Edit(), not Write() — Edit rules cover every file-editing tool, and
+      // Write() rules cover nothing. See (1) above.
+      allow: [`Edit(${reportPath})`],
       deny: [
-        'Write(*)',
-        'Edit(*)',
-        'NotebookEdit(*)',
         'Bash(git push:*)',
         'Bash(git commit:*)',
         'Bash(git reset:*)',
