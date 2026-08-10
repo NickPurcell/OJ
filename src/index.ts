@@ -564,11 +564,21 @@ async function main(): Promise<void> {
     const remaining = config.pollIntervalSeconds * 1000 - (Date.now() - startedAt);
     if (remaining > 0 && !stopping) {
       await new Promise<void>((done) => {
+        // NOT unref'd. It was, on the reasoning that a SIGTERM during the idle
+        // gap should not wait out the rest of the interval — but an unref'd
+        // timer is the *only* handle this process holds while idle, so the
+        // event loop drained on the first sleep and Node exited with status 13,
+        // "Detected unsettled top-level await". On 2026-08-10 that read as a
+        // crash loop moments after a clean, correct startup banner.
+        //
+        // Prompt shutdown was never the timer's job: `shutdown()` calls
+        // `pendingSleep()` directly, which resolves this promise immediately.
+        // The unref bought nothing and cost the process its life.
         const timer = setTimeout(done, remaining);
-        timer.unref();
-        // unref'd so a SIGTERM during the idle gap exits promptly instead of
-        // holding the process open for the rest of the interval.
-        pendingSleep = done;
+        pendingSleep = () => {
+          clearTimeout(timer);
+          done();
+        };
       });
     }
   }

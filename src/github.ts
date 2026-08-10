@@ -38,6 +38,18 @@ export class GitHubError extends Error {
  * the App changes `.env` and restarts, and no other code moves.
  */
 export interface GitHubAuth {
+  /**
+   * A JSON Web Token signed as the app, for the handful of endpoints that
+   * authenticate as the *app* rather than as an installation — `/app` being
+   * the one OJ uses. Null for a PAT, which has no such concept.
+   *
+   * This exists because the two credentials are not interchangeable and the
+   * failure is confusing: passing an installation token (`ghs_…`) to `/app`
+   * returns 401 "A JSON web token could not be decoded", which reads like a
+   * malformed key rather than the wrong credential entirely. On 2026-08-10
+   * that cost an evening's confidence in a correctly configured GitHub App.
+   */
+  appJwt?(): string | null;
   /** A token good for at least the next few seconds. May mint a fresh one. */
   token(): Promise<string>;
   /** For logs and the startup banner. Never includes the credential. */
@@ -128,6 +140,10 @@ class AppAuth implements GitHubAuth {
   }
 
   /** RS256 JWT, signed with node:crypto so this needs no JWT library. */
+  appJwt(): string | null {
+    return this.#appJwt();
+  }
+
   #appJwt(): string {
     const now = Math.floor(Date.now() / 1000);
     const header = { alg: 'RS256', typ: 'JWT' };
@@ -473,7 +489,25 @@ export class GitHubClient {
     if (this.auth.describe().startsWith('GitHub App')) {
       // Apps have no /user. The bot login is `<app slug>[bot]`, which /app
       // gives us without needing the installation.
-      const app = await this.#request<{ slug?: string }>('GET', '/app');
+      // `/app` authenticates as the APP, so it needs the JWT — an installation
+      // token is rejected with 401 "A JSON web token could not be decoded",
+      // which sounds like a broken key and is not. Everything else in this
+      // client correctly uses the installation token, which is why minting and
+      // listing worked while only this call failed.
+      const jwt = this.auth.appJwt?.() ?? null;
+      if (!jwt) return '';
+      const response = await fetch(`${this.apiBaseUrl}/app`, {
+        headers: {
+          authorization: `Bearer ${jwt}`,
+          accept: 'application/vnd.github+json',
+          'x-github-api-version': '2022-11-28',
+          'user-agent': 'oj-review-bot',
+        },
+      });
+      if (!response.ok) {
+        throw new GitHubError(response.status, 'GET', '/app', await response.text());
+      }
+      const app = (await response.json()) as { slug?: string };
       return app.slug ? `${app.slug}[bot]` : '';
     }
     const user = await this.#request<{ login?: string }>('GET', '/user');
