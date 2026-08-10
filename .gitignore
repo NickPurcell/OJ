@@ -1,0 +1,20 @@
+node_modules/
+dist/
+
+# Carries the GitHub credential. The negation keeps the template tracked —
+# without it, adding .env.* silently untracks the one file here meant to be
+# committed.
+.env
+.env.*
+!.env.example
+*.log
+
+# The GitHub App private key. It signs the JWT that mints installation tokens,
+# so a copy in the tree is a copy of every permission the app has.
+*.pem
+*.private-key.pem
+
+# Local state, if you point paths.stateFile at the working directory rather
+# than /var/lib/oj while developing.
+state.json
+workers/

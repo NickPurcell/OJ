@@ -1,0 +1,148 @@
+# OJ behaviour. No secrets here — credentials live in .env.
+#
+# Every key is optional and falls back to the default in src/config.ts, with
+# one exception: `repos` must name at least one repository. Override the path
+# to this file with OJ_CONFIG_PATH.
+
+# ── Polling ───────────────────────────────────────────────────────────────
+# Webhooks would be lower-latency, but the review host is behind NAT and a
+# tunnel is one more thing that can quietly stop working. A poll that misses a
+# tick simply runs late.
+#
+# Budget: one request per repo per tick, plus a handful per review. Against a
+# GitHub App's 5000/hour, sixty seconds across ten repos is comfortable.
+pollIntervalSeconds: 60
+
+# ── Verdict ceiling ───────────────────────────────────────────────────────
+# The global cap on what a review may become, applied after the per-repo
+# mapping below has decided what it wants to be.
+#
+#   comment — every review posts as a COMMENT, whatever it found. The verdict
+#             it *would* have given is printed in the review footer, so you can
+#             read a month of reviews and judge whether you would have agreed.
+#   full    — honour approveWhenClean / requestChangesWhenBlocking.
+#
+# Stay on `comment` until you trust it. A bot that can REQUEST_CHANGES can
+# block a release over a hallucination, and a bot that can APPROVE can be the
+# reason nobody looked. Switching later is one word and a restart.
+verdictMode: comment
+
+# Reviews running at once, across every repo. Each one is a Claude Code process
+# with subagents beneath it — this is a memory limit, not an API limit.
+maxConcurrentReviews: 2
+
+github:
+  # Change both for GitHub Enterprise Server. The API base needs the /api/v3
+  # suffix there; the git base does not.
+  apiBaseUrl: https://api.github.com
+  gitBaseUrl: https://github.com
+
+paths:
+  # One directory per open pull request: a clone, the rendered kickoff prompt,
+  # and the worker's report. Removed when the PR merges or closes.
+  workersRoot: /var/lib/oj/workers
+  # The kickoff prompt handed to every worker. Relative paths resolve against
+  # the service's working directory.
+  kickoffPrompt: OJ.md
+  systemPrompt: prompts/worker-system-prompt.md
+  stateFile: /var/lib/oj/state.json
+
+worker:
+  # Absolute: systemd hands services a minimal PATH, and a worker that cannot
+  # be spawned looks exactly like a review that never finished.
+  claudePath: /usr/local/bin/claude
+  # Empty means whatever the CLI is configured to use. Review is a reasoning
+  # task with a lot of fan-out; pin it here if you want reviews to stay on one
+  # model across a CLI upgrade.
+  model: ""
+  # Hard cap on one round. Generous, because the workflow fans out three
+  # verifiers per candidate finding and each of those reads real code.
+  timeoutMinutes: 45
+  # Commits fetched for the head and the base. Deepened automatically when the
+  # merge base is not in range, so this is a starting guess rather than a limit.
+  fetchDepth: 100
+
+  # Extra environment variables the worker inherits.
+  #
+  # The worker's environment is built from an allowlist — see workerEnv() in
+  # src/worker.ts. Anything named here is handed to a process whose entire job
+  # is reading code written by strangers. GitHub credentials are refused by
+  # name at startup; nothing else is checked, because nothing else can be.
+  envPassthrough: []
+
+  # Deleted from the checkout after checkout, and marked `-diff` so their
+  # contents cannot reach the worker through the diff either.
+  #
+  # These are the file names that agentic tools read as instructions. A pull
+  # request that adds one is a pull request trying to configure its own
+  # reviewer. Add to this list as new tools invent new conventions; the cost of
+  # a false positive is that the worker sees "file changed" without the text.
+  stripPaths:
+    - CLAUDE.md
+    - "**/CLAUDE.md"
+    - .claude
+    - "**/.claude"
+    - OJ.md
+    - "**/OJ.md"
+    - AGENTS.md
+    - "**/AGENTS.md"
+    - .cursorrules
+    - .cursor
+    - .windsurfrules
+    - .github/copilot-instructions.md
+
+review:
+  # Posted the moment a round starts, before any work happens. A review takes
+  # tens of minutes and from the outside "thinking" and "crashed" look
+  # identical — this is the difference. `{pr}` is substituted.
+  acknowledgement: >-
+    🧬 OJ is reviewing this pull request. I will post findings here when the
+    sweep finishes — if nothing appears within the hour, something broke on my
+    end.
+
+  # Reclaim the directory of a pull request that has gone quiet without
+  # closing. The session transcript survives, and the directory path is
+  # deterministic, so a later round rebuilds the clone and resumes the same
+  # conversation. 0 disables the sweep.
+  workerTtlHours: 72
+
+  # Attach findings to specific lines of the diff. Best effort: GitHub rejects
+  # the whole review if any comment lands off the diff, so a rejection retries
+  # with the locations in the body instead.
+  inlineComments: true
+
+# ── House policy ──────────────────────────────────────────────────────────
+# Inherited by every repo below, which may override any of it.
+defaults:
+  # Add this label to a pull request to ask for a review. OJ removes it when it
+  # starts, so re-adding it is how you ask for another round after a fix.
+  reviewLabel: "oj:review"
+
+  # Review a pull request the first time OJ sees it, without waiting for the
+  # label. Baselined on first sight of each repo, so turning this on does not
+  # fan out across every pull request that is already open.
+  reviewNewPrs: false
+
+  # Drafts are usually still being written.
+  reviewDrafts: false
+
+  # Fork pull requests are fetched from refs/pull/N/head on the base repo, so
+  # OJ never authenticates against a repository an outsider chose, and the
+  # worker never holds a credential. It is still someone else's code being
+  # cloned onto your host, so it is a decision rather than a default.
+  reviewForks: false
+
+  # The mapping from findings to a GitHub review event. Both are subject to
+  # verdictMode above, which is why they can be left on while you evaluate.
+  approveWhenClean: true
+  requestChangesWhenBlocking: true
+
+# ── Watched repositories ──────────────────────────────────────────────────
+# Either "owner/repo" or a mapping that overrides any policy key above.
+repos:
+  - NickPurcell/OJ
+
+  # - slug: NickPurcell/Clawcius
+  #   reviewNewPrs: true
+  #   verdictMode: full
+  #   reviewLabel: "review-me"

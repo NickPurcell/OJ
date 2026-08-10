@@ -1,0 +1,102 @@
+[Unit]
+Description=OJO — polls GitHub pull requests and runs headless Claude Code reviews
+Documentation=file:/home/npurcell/oj/SETUP.md
+After=network-online.target
+Wants=network-online.target
+
+# Never give up on a crash loop. These are [Unit] directives — in [Service]
+# systemd ignores them with a warning, leaving the default of 5 starts per 10s
+# before permanently stopping the unit, which for a service that is supposed to
+# be watching repositories means it stops watching and nothing says so.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+
+# Runs as npurcell, not a dedicated service account, and that is load-bearing:
+# workers authenticate to Anthropic with the same OAuth login as Claude Code,
+# and those credentials live in this user's home directory. A service account
+# with no login would spawn workers that fail on auth, which surfaces as every
+# review timing out.
+#
+# Switch to a dedicated user only if you also set ANTHROPIC_API_KEY in .env —
+# and if you do, consider giving the *worker* its own user instead, which is
+# the isolation this design does not currently have. See README § Security model.
+User=npurcell
+Group=npurcell
+
+WorkingDirectory=/home/npurcell/oj
+EnvironmentFile=/home/npurcell/oj/.env
+
+# An absolute path in ExecStart is not enough. Workers are spawned as child
+# processes that invoke bare `node` and bare `git`, and systemd hands services
+# a minimal PATH that excludes ~/.local — so OJO would start fine and every
+# review would die with ENOENT.
+Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Node's fetch ignores HTTP_PROXY/HTTPS_PROXY unless told otherwise. On a host
+# whose only route out is a proxy, that means every GitHub request fails with
+# EAI_AGAIN — a DNS error, which reads as a network outage rather than as a
+# process not using the proxy it was given. Harmless when there is no proxy.
+#
+# The variable rather than --use-env-proxy: an unrecognised CLI flag stops Node
+# from starting, so an older 22.x would fail to boot over something it does not
+# need. An unrecognised variable is ignored.
+Environment=NODE_USE_ENV_PROXY=1
+
+ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+
+# ── Restart policy ────────────────────────────────────────────────────────
+Restart=always
+RestartSec=10
+
+# A review round can run for the better part of an hour, and systemd will not
+# wait for one. OJO exits a few seconds after SIGTERM and lets its workers die
+# with it, which is safe: sessions are keyed by a deterministic id derived from
+# the PR, so a round killed mid-flight is resumed — not restarted — by
+# re-adding the label.
+TimeoutStopSec=30
+KillMode=mixed
+
+# ── State ─────────────────────────────────────────────────────────────────
+# Creates and chowns /var/lib/oj, which holds state.json and one directory per
+# open pull request. Those directories are full checkouts, so size this mount
+# for (number of watched repos × their size × open PRs), not for a JSON file.
+StateDirectory=oj
+StateDirectoryMode=0750
+
+# ── Resource limits ───────────────────────────────────────────────────────
+# Each concurrent review is a Claude Code process with subagents beneath it.
+# Raise these together with maxConcurrentReviews in oj-config.yaml, never one
+# alone — a cap raised without memory to back it turns a slow review into an
+# OOM kill partway through, which loses the round and posts nothing.
+MemoryHigh=4G
+MemoryMax=6G
+TasksMax=1024
+
+# ── Hardening ─────────────────────────────────────────────────────────────
+# Modest on purpose, and the reason is worth knowing before tightening it: the
+# processes under this unit are agents that read untrusted code and run the
+# repository's own tooling — test suites, package managers, build systems. Most
+# of the interesting sandboxing directives break at least one of those in a way
+# that surfaces as "the review found nothing" rather than as an error.
+#
+# ProtectHome in particular cannot be used: the OAuth credential the workers
+# authenticate with lives in the home directory.
+#
+# Anything added here must be verified with a real review against a real PR,
+# not by reading — a broken worker looks exactly like a quiet one.
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RemoveIPC=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oj
+
+[Install]
+WantedBy=multi-user.target
