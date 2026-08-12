@@ -240,12 +240,6 @@ function toPullRequest(raw: RawPull, slug: string): PullRequest {
 
 export type ReviewEvent = 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES';
 
-export type ReviewComment = {
-  path: string;
-  line: number;
-  body: string;
-};
-
 const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
 /**
@@ -396,13 +390,74 @@ export class GitHubClient {
     return toPullRequest(raw, `${owner}/${repo}`);
   }
 
+  /** Returns the comment's URL, which the worker is told so it can refer to it. */
   async createIssueComment(
     owner: string,
     repo: string,
     number: number,
     body: string,
-  ): Promise<void> {
-    await this.#request('POST', `/repos/${owner}/${repo}/issues/${number}/comments`, { body });
+  ): Promise<string> {
+    const created = await this.#request<{ html_url?: string }>(
+      'POST',
+      `/repos/${owner}/${repo}/issues/${number}/comments`,
+      { body },
+    );
+    return created?.html_url ?? '';
+  }
+
+  /**
+   * Open an issue.
+   *
+   * Reached only from the desk, and the desk supplies `owner`/`repo` from the
+   * review it is serving — never from anything the worker wrote. That is the
+   * entire safety argument for handing an agent that reads untrusted code the
+   * ability to create issues, and it lives at the call site in `index.ts`.
+   */
+  async createIssue(owner: string, repo: string, title: string, body: string): Promise<string> {
+    const created = await this.#request<{ html_url?: string }>(
+      'POST',
+      `/repos/${owner}/${repo}/issues`,
+      { title, body },
+    );
+    return created?.html_url ?? '';
+  }
+
+  /** Issue comments on a PR, oldest first. What `oj comments` prints. */
+  async listIssueComments(
+    owner: string,
+    repo: string,
+    number: number,
+  ): Promise<Array<{ author: string; createdAt: string; body: string }>> {
+    const raw = await this.#paged<{
+      user?: { login?: string } | null;
+      created_at?: string;
+      body?: string | null;
+    }>(`/repos/${owner}/${repo}/issues/${number}/comments`);
+    return raw.map((entry) => ({
+      author: entry.user?.login ?? '(unknown)',
+      createdAt: entry.created_at ?? '',
+      body: entry.body ?? '',
+    }));
+  }
+
+  /** The files a PR touches. What `oj pr` prints under "changed files". */
+  async listPullFiles(
+    owner: string,
+    repo: string,
+    number: number,
+  ): Promise<Array<{ filename: string; status: string; additions: number; deletions: number }>> {
+    const raw = await this.#paged<{
+      filename?: string;
+      status?: string;
+      additions?: number;
+      deletions?: number;
+    }>(`/repos/${owner}/${repo}/pulls/${number}/files`);
+    return raw.map((entry) => ({
+      filename: entry.filename ?? '',
+      status: entry.status ?? 'modified',
+      additions: entry.additions ?? 0,
+      deletions: entry.deletions ?? 0,
+    }));
   }
 
   /**
@@ -430,16 +485,13 @@ export class GitHubClient {
   }
 
   /**
-   * Post a review.
+   * Post a review — the verdict, and only the verdict.
    *
-   * `comments` is best effort by contract: GitHub validates every inline
-   * comment against the diff and rejects the *entire* review with a 422 if one
-   * line is not in it, which would throw away a finished review over a
-   * misremembered line number. So a 422 retries once with the comments
-   * dropped, and the caller is told they were dropped so the body can carry
-   * the locations instead.
-   *
-   * Returns whether the inline comments survived.
+   * The findings are not here. As of 2026-08-11 the worker posts those itself
+   * through the `oj` CLI while it is still running, so a review event is a
+   * one-line APPROVE or REQUEST_CHANGES pointing at the comment that already
+   * exists. `index.ts` does not post one at all when the verdict maps to
+   * COMMENT, because that would be the same review twice.
    */
   async createReview(
     owner: string,
@@ -447,41 +499,15 @@ export class GitHubClient {
     number: number,
     event: ReviewEvent,
     body: string,
-    comments: ReviewComment[] = [],
     commitId?: string,
-  ): Promise<{ inlineCommentsPosted: boolean }> {
-    const path = `/repos/${owner}/${repo}/pulls/${number}/reviews`;
-    const base = {
+  ): Promise<void> {
+    await this.#request('POST', `/repos/${owner}/${repo}/pulls/${number}/reviews`, {
       event,
       body,
       // Pinning the review to the SHA that was actually reviewed is what keeps
       // a review from silently attaching to a commit pushed while it ran.
       ...(commitId ? { commit_id: commitId } : {}),
-    };
-
-    if (comments.length > 0) {
-      try {
-        await this.#request('POST', path, {
-          ...base,
-          comments: comments.map((comment) => ({
-            path: comment.path,
-            line: comment.line,
-            side: 'RIGHT',
-            body: comment.body,
-          })),
-        });
-        return { inlineCommentsPosted: true };
-      } catch (error) {
-        if (!(error instanceof GitHubError) || error.status !== 422) throw error;
-        process.stderr.write(
-          `[oj] ${owner}/${repo}#${number}: inline comments rejected (${error.body.slice(0, 160)}) — ` +
-            'reposting with locations in the body\n',
-        );
-      }
-    }
-
-    await this.#request('POST', path, base);
-    return { inlineCommentsPosted: false };
+    });
   }
 
   /** The account OJO is acting as. Used to notice self-review, which GitHub forbids. */

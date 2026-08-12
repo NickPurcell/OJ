@@ -133,13 +133,21 @@ export type OjConfig = {
     /** Delete a worker directory after this many hours with no activity. 0 disables. */
     workerTtlHours: number;
     /**
-     * Try to attach findings as inline review comments on the diff.
+     * Comments one round's worker may post through `oj comment`.
      *
-     * Best effort: GitHub rejects the whole review if any comment lands on a
-     * line outside the diff, so a rejection retries with the findings in the
-     * body instead. Nothing is lost when it fails, only located.
+     * A review is normally one comment. The ceiling exists because the worker
+     * reads attacker-authored code and an injected one should not be able to
+     * turn a pull request into a thousand-comment thread; it is deliberately
+     * well above what an honest review needs.
      */
-    inlineComments: boolean;
+    maxCommentsPerRound: number;
+    /**
+     * Issues one round's worker may open through `oj issue`.
+     *
+     * Same reasoning, lower number: issues live outside the pull request and
+     * someone has to close them by hand.
+     */
+    maxIssuesPerRound: number;
   };
 
   repos: RepoConfig[];
@@ -195,7 +203,8 @@ const DEFAULTS = {
       '🧬 OJ is reviewing this pull request. I will post findings here when the ' +
       'sweep finishes — if nothing appears within the hour, something broke on my end.',
     workerTtlHours: 72,
-    inlineComments: true,
+    maxCommentsPerRound: 10,
+    maxIssuesPerRound: 5,
   },
 } as const;
 
@@ -423,10 +432,17 @@ export function loadConfig(configPath?: string): OjConfig {
         DEFAULTS.review.workerTtlHours,
         0,
       ),
-      inlineComments: bool(
-        review['inlineComments'],
-        'review.inlineComments',
-        DEFAULTS.review.inlineComments,
+      maxCommentsPerRound: num(
+        review['maxCommentsPerRound'],
+        'review.maxCommentsPerRound',
+        DEFAULTS.review.maxCommentsPerRound,
+        1,
+      ),
+      maxIssuesPerRound: num(
+        review['maxIssuesPerRound'],
+        'review.maxIssuesPerRound',
+        DEFAULTS.review.maxIssuesPerRound,
+        0,
       ),
     },
     repos,

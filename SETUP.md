@@ -45,18 +45,25 @@ you can see a review land before committing to twenty minutes of setup.
    creates an endpoint that fails every delivery and eventually gets disabled
    with an email, which is noise about a thing you were not using.
 
-4. **Repository permissions** — exactly these three:
+4. **Repository permissions** — exactly these four:
 
    | Permission | Level | Why |
    |---|---|---|
    | **Contents** | Read-only | clone the PR head; read `OJ.md` from the base branch |
    | **Pull requests** | Read & write | post reviews and comments; remove the trigger label |
+   | **Issues** | Read & write | `oj issue`, for bugs outside the pull request's scope |
    | **Metadata** | Read-only | mandatory, granted automatically |
 
    Nothing else. In particular **not** Contents write: OJ does not push, and an
    app that cannot push is an app that cannot be talked into pushing. If you
    ever find yourself adding a permission to make something work, that is worth
    a conversation rather than a checkbox.
+
+   **Issues** is the one addition since the first version, and it is the one to
+   think about: it lets a review open issues on the repository under review, and
+   nowhere else. Set `review.maxIssuesPerRound: 0` and leave the permission off
+   if you would rather it did not — the refusal tells the worker to put those
+   findings in its comment instead, and nothing else changes.
 
    Note what `Pull requests: write` includes — it can post reviews, and a review
    is an approval when it wants to be. That is the permission that makes
@@ -106,8 +113,9 @@ seconds; if the host is more than a minute out, fix NTP.
 
 Use a **fine-grained** token from
 [Settings → Developer settings → Personal access tokens](https://github.com/settings/personal-access-tokens),
-scoped to only the repositories you want reviewed, with **Contents: read** and
-**Pull requests: read and write**.
+scoped to only the repositories you want reviewed, with **Contents: read**,
+**Pull requests: read and write**, and **Issues: read and write** (or leave
+Issues off and set `review.maxIssuesPerRound: 0`).
 
 ```
 OJ_GITHUB_TOKEN=github_pat_...
@@ -123,7 +131,8 @@ that account. Move to the App when you stop experimenting.
 git clone https://github.com/NickPurcell/OJ.git /home/npurcell/oj
 cd /home/npurcell/oj
 npm install
-npm run build
+npm run build   # OJO, and the `oj` CLI every worker is given
+npm test        # optional, and offline: the GitHub side is fixtured
 
 sudo install -d -m 0750 -o npurcell -g npurcell /var/lib/oj
 cp .env.example .env && chmod 600 .env
@@ -159,7 +168,8 @@ stop now — that is the account whose approvals will start appearing.
 
 Add the label to a pull request. Within one poll interval you should see an
 acknowledgement comment, then a directory appear under `/var/lib/oj/workers`,
-then several minutes of `tool …` lines, then a review.
+then several minutes of `tool …` lines, then an `oj comment: posted …` line as
+the worker files its review, and an `oj verdict:` line just after it.
 
 ## Run it under systemd
 
@@ -294,9 +304,12 @@ round two knows what round one said and will tell you what got fixed.
 **Watch one**: `journalctl -u oj -f`. Lines are prefixed `owner/repo#123`.
 
 **Inspect one**: `/var/lib/oj/workers/<owner>__<repo>__<n>/` holds the clone,
-the exact rendered prompt (`oj/kickoff-round-N.md`), and the report
-(`oj/report.json`). When a review comes back strange, the kickoff file answers
-"what was it actually asked?" without re-deriving it.
+the exact rendered prompt (`oj/kickoff-round-N.md`), the `oj` shim the worker
+posts through (`bin/oj`), and the desk it posts through (`desk/requests`,
+`desk/results` — both empty between rounds, because every request is served and
+removed within a second). When a review comes back strange, the kickoff file
+answers "what was it actually asked?" without re-deriving it, and the journal
+carries one `oj <action>:` line per thing the worker asked OJO to do.
 
 **Reset one**: delete the directory. The next round rebuilds it. To also drop
 the conversation, delete the Claude Code session — the session id is a UUIDv5
@@ -331,21 +344,30 @@ the installation's repository access.
 The journal shows no `tool …` lines at all in this case, which distinguishes it
 from a review that is merely slow.
 
-**"the worker exited cleanly without writing …/report.json".** The session ran
-and decided it was done without producing the file. Read
-`oj/kickoff-round-N.md` and the transcript. Usually the kickoff was edited into
-something ambiguous about the output contract.
+**"the worker finished without posting a comment" (`said-nothing`).** The
+session ran and decided it was done without running `oj comment`, so the round
+produced no review. Read `oj/kickoff-round-N.md` and the transcript; usually the
+kickoff has been edited into something ambiguous about what a round must
+produce. If the journal shows `oj comment: REFUSED`, the request was rejected
+and the reason is on that line — a per-round cap, or a request that tried to
+name a target.
 
-**Reviews come back empty on a big PR.** Check `notes` in the posted review —
-workers are told to say what they could not check. Consider raising
-`worker.timeoutMinutes`, or asking for the pull request to be split, which is
-also a fair review comment.
+**"the oj CLI is missing at …/dist/oj-cli.js".** OJO is running from source that
+was never built, or from a `dist/` predating the CLI. `npm run build`. The
+review is refused before the clone rather than after forty minutes, because a
+worker with no channel to GitHub cannot produce anything.
 
-**A review posted as COMMENT when I expected APPROVE.** Read the footer. It
-says whether the verdict was capped by `verdictMode`, and `verdictMode` is
-resolved per repository — a global `full` with a repo-level override loses to
-the override.
+**Reviews come back thin on a big PR.** Workers are told to say what they could
+not check, so the comment should say. Consider raising `worker.timeoutMinutes`,
+or asking for the pull request to be split, which is also a fair review comment.
 
-**Findings have no line numbers.** GitHub rejected them as inline comments
-because a line was not part of the diff, and OJ reposted with the locations in
-a follow-up comment. The journal line says `inline comments rejected`.
+**A review posted as COMMENT when I expected APPROVE.** Three candidates, in the
+order worth checking. The journal line for the round prints `verdict none` if
+the worker never ran `oj verdict` — a missing verdict is always a COMMENT and
+never an APPROVE. It prints `(capped from APPROVE)` if `verdictMode` did it, and
+`verdictMode` is resolved per repository, so a global `full` loses to a
+repo-level override. And GitHub refuses to let an account approve its own pull
+request, which OJ detects rather than retrying into.
+
+**The worker opened issues I did not want.** `review.maxIssuesPerRound: 0` turns
+`oj issue` off; the refusal tells the worker to put them in its comment instead.
