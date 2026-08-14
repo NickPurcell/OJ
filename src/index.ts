@@ -19,6 +19,7 @@
 
 import { mkdirSync } from 'node:fs';
 import { loadAuthEnv, loadConfig, type OjConfig, type RepoConfig } from './config.js';
+import type { DeskGateway } from './desk.js';
 import {
   createAuth,
   GitHubClient,
@@ -26,7 +27,13 @@ import {
   type PullRequest,
   type ReviewEvent,
 } from './github.js';
-import { blockingFindings, inlineCommentsFor, renderReviewBody } from './report.js';
+import {
+  decideEvent,
+  failureComment,
+  renderComments,
+  renderPullFacts,
+  verdictBody,
+} from './review.js';
 import { prKey, StateStore } from './state.js';
 import { removeWorkerDir, runReview, sessionIdFor, workerDirFor } from './worker.js';
 
@@ -128,53 +135,57 @@ function declineReason(repo: RepoConfig, pull: PullRequest): string | null {
 // ── posting ──────────────────────────────────────────────────────────────────
 
 /**
- * Post the review, degrading rather than failing.
+ * The desk's GitHub side, bound to one pull request.
  *
- * GitHub rejects a whole review for reasons that have nothing to do with its
- * content: an inline comment on a line outside the diff, a `commit_id` that a
- * force-push orphaned mid-review, an APPROVE on a PR the app itself opened.
- * Every one of those would throw away a finished review, which is the most
- * expensive thing this service produces. So each failure drops one requirement
- * and tries again, and the last resort is a plain issue comment — ugly, but
- * the findings reach a human.
+ * This closure is where the safety property of the whole `oj` CLI actually
+ * lives. `owner`, `repo` and `pull.number` are captured here, by the process
+ * that holds the credential, from the review it decided to run. Nothing the
+ * worker writes reaches these three values — there is no path for it to, which
+ * is why `desk.ts` refuses a request that so much as names a repository rather
+ * than trying to validate one.
  */
-async function postReview(
+function gatewayFor(repo: RepoConfig, pull: PullRequest): DeskGateway {
+  return {
+    postComment: (body) => client.createIssueComment(repo.owner, repo.repo, pull.number, body),
+    openIssue: (title, body) => client.createIssue(repo.owner, repo.repo, title, body),
+    describePull: async () =>
+      renderPullFacts(pull, await client.listPullFiles(repo.owner, repo.repo, pull.number)),
+    listComments: async () =>
+      renderComments(await client.listIssueComments(repo.owner, repo.repo, pull.number)),
+  };
+}
+
+/**
+ * Post the verdict, degrading rather than failing.
+ *
+ * GitHub rejects a review for reasons that have nothing to do with its content:
+ * a `commit_id` that a force-push orphaned mid-review, an APPROVE on a PR the
+ * app itself opened. Each failure drops one requirement and tries again.
+ *
+ * Less is at stake here than there used to be. The review itself is already on
+ * the pull request — the worker posted it through `oj comment` while it was
+ * still running — so the worst case is a missing APPROVE next to a review a
+ * human can read, rather than a lost review.
+ */
+async function postVerdict(
   repo: RepoConfig,
   pull: PullRequest,
   event: ReviewEvent,
   body: string,
-  comments: Array<{ path: string; line: number; body: string }>,
-  headSha: string,
-): Promise<{ event: ReviewEvent; inline: boolean }> {
-  const attempts: Array<{
-    event: ReviewEvent;
-    comments: typeof comments;
-    commit: string | undefined;
-    note: string;
-  }> = [
-    { event, comments, commit: headSha, note: 'full' },
-    { event, comments: [], commit: headSha, note: 'without inline comments' },
-    { event, comments: [], commit: undefined, note: 'without a pinned commit' },
-    { event: 'COMMENT', comments: [], commit: undefined, note: 'downgraded to COMMENT' },
+): Promise<ReviewEvent | null> {
+  const attempts: Array<{ event: ReviewEvent; commit: string | undefined; note: string }> = [
+    { event, commit: pull.headSha, note: 'full' },
+    { event, commit: undefined, note: 'without a pinned commit' },
   ];
 
   let lastError: unknown = null;
   for (const attempt of attempts) {
-    if (attempt.comments.length === 0 && comments.length > 0 && attempt.note === 'full') continue;
     try {
-      const result = await client.createReview(
-        repo.owner,
-        repo.repo,
-        pull.number,
-        attempt.event,
-        body,
-        attempt.comments,
-        attempt.commit,
-      );
+      await client.createReview(repo.owner, repo.repo, pull.number, attempt.event, body, attempt.commit);
       if (attempt.note !== 'full') {
-        warn(`${repo.slug}#${pull.number}: review posted ${attempt.note}`);
+        warn(`${repo.slug}#${pull.number}: verdict posted ${attempt.note}`);
       }
-      return { event: attempt.event, inline: result.inlineCommentsPosted };
+      return attempt.event;
     } catch (error) {
       lastError = error;
       if (!(error instanceof GitHubError) || (error.status !== 422 && error.status !== 403)) throw error;
@@ -182,46 +193,10 @@ async function postReview(
   }
 
   warn(
-    `${repo.slug}#${pull.number}: every review attempt was rejected (${String(lastError)}) — ` +
-      'falling back to an issue comment',
+    `${repo.slug}#${pull.number}: the ${event} review was rejected (${String(lastError)}) — ` +
+      'the review comment stands on its own',
   );
-  await client.createIssueComment(repo.owner, repo.repo, pull.number, body);
-  return { event: 'COMMENT', inline: false };
-}
-
-/**
- * Map findings onto a GitHub review event.
- *
- * `verdictMode: comment` caps the result no matter what the mapping says, and
- * the cap is reported in the review footer. That default exists because the
- * first month of running a review bot is spent finding out whether you believe
- * it, and a bot that can block merges while you are still deciding is a bot
- * that gets uninstalled instead of tuned.
- */
-function decideVerdict(
-  repo: RepoConfig,
-  pull: PullRequest,
-  blockingCount: number,
-): { event: ReviewEvent; downgraded: boolean } {
-  const wanted: ReviewEvent =
-    blockingCount > 0
-      ? repo.requestChangesWhenBlocking
-        ? 'REQUEST_CHANGES'
-        : 'COMMENT'
-      : repo.approveWhenClean
-        ? 'APPROVE'
-        : 'COMMENT';
-
-  if (repo.verdictMode !== 'full') {
-    return { event: 'COMMENT', downgraded: wanted !== 'COMMENT' };
-  }
-  // GitHub refuses to let an account approve or request changes on its own
-  // pull request. Catching it here rather than in the 422 fallback keeps the
-  // log readable when OJ reviews a PR that OJ opened.
-  if (identity && pull.authorLogin === identity && wanted !== 'COMMENT') {
-    return { event: 'COMMENT', downgraded: true };
-  }
-  return { event: wanted, downgraded: false };
+  return null;
 }
 
 // ── one review ───────────────────────────────────────────────────────────────
@@ -267,6 +242,7 @@ async function review(queued: QueuedReview): Promise<void> {
       pull,
       round,
       gitToken: await client.gitToken(),
+      gateway: gatewayFor(repo, pull),
       onProgress: (line) => log(`${key} · ${line}`),
     },
     existing?.lastReviewedHeadSha ?? null,
@@ -290,6 +266,11 @@ async function review(queued: QueuedReview): Promise<void> {
 
   if (!outcome.ok) {
     warn(`${key}: round ${round} failed after ${seconds}s — ${outcome.reason}: ${outcome.detail}`);
+    if (outcome.ledger.issues.length > 0) {
+      // Worth a line: the round failed, but it opened issues on the way, and an
+      // operator wondering where they came from should not have to guess.
+      warn(`${key}: the failed round had already opened ${outcome.ledger.issues.length} issue(s)`);
+    }
     // Report the failure where the humans are. Silence after an acknowledgement
     // is worse than no acknowledgement at all.
     try {
@@ -297,17 +278,7 @@ async function review(queued: QueuedReview): Promise<void> {
         repo.owner,
         repo.repo,
         pull.number,
-        [
-          '## OJ review failed',
-          '',
-          `The review round did not complete (\`${outcome.reason}\`).`,
-          '',
-          '```',
-          outcome.detail.slice(0, 1500),
-          '```',
-          '',
-          `Re-add the \`${repo.reviewLabel}\` label to try again.`,
-        ].join('\n'),
+        failureComment(outcome.reason, outcome.detail, repo.reviewLabel),
       );
     } catch (error) {
       warn(`${key}: could not report the failure either — ${String(error)}`);
@@ -315,60 +286,30 @@ async function review(queued: QueuedReview): Promise<void> {
     return;
   }
 
-  const { report, dropped } = outcome;
-  const blocking = blockingFindings(report);
-  const { event, downgraded } = decideVerdict(repo, pull, blocking.length);
+  const { ledger } = outcome;
+  const decision = decideEvent(ledger.verdict, repo, pull, identity);
 
-  // The worker was told which SHA it was reviewing. If it says it reviewed a
-  // different one, something is wrong with the checkout and the review is
-  // about the wrong code — worth a line in the journal, not worth withholding.
-  if (report.reviewedHeadSha && !pull.headSha.startsWith(report.reviewedHeadSha.slice(0, 7))) {
-    warn(
-      `${key}: worker reported reviewing ${report.reviewedHeadSha} but the PR head is ${pull.headSha}`,
+  // Only a real verdict gets its own review. A COMMENT event here would be the
+  // second copy of a review the worker has already posted — the comment IS the
+  // report — and the reason it was capped is in that comment's footer already.
+  let postedEvent: ReviewEvent | null = null;
+  if (decision.event !== 'COMMENT') {
+    postedEvent = await postVerdict(
+      repo,
+      pull,
+      decision.event,
+      verdictBody(decision, round, pull.headSha, ledger.comments[0] ?? null),
     );
   }
 
-  const inline = config.review.inlineComments ? inlineCommentsFor(report) : [];
-  // Rendered twice when inline comments are dropped: the body has to carry the
-  // file and line in prose in that case, and we do not know whether they were
-  // dropped until we have tried. Rendering is free; a review without locations
-  // is not.
-  const bodyWith = renderReviewBody(report, {
-    headSha: pull.headSha,
-    round,
-    verdictMode: repo.verdictMode,
-    downgraded,
-    locateInBody: inline.length === 0,
-    dropped,
-  });
-
-  const posted = await postReview(repo, pull, event, bodyWith, inline, pull.headSha);
-
-  if (inline.length > 0 && !posted.inline) {
-    // The locations never made it onto the diff. Post them as a follow-up
-    // comment rather than leaving findings pointing at nothing.
-    const locations = report.findings
-      .filter((finding) => finding.file)
-      .map((finding) => `- \`${finding.file}${finding.line ? `:${finding.line}` : ''}\` — ${finding.title}`);
-    if (locations.length > 0) {
-      try {
-        await client.createIssueComment(
-          repo.owner,
-          repo.repo,
-          pull.number,
-          ['**Finding locations** (GitHub rejected them as inline comments):', '', ...locations].join('\n'),
-        );
-      } catch (error) {
-        warn(`${key}: could not post finding locations — ${String(error)}`);
-      }
-    }
-  }
-
   log(
-    `${key}: round ${round} ${posted.event} in ${seconds}s — ` +
-      `${blocking.length} blocking, ${report.findings.length - blocking.length} non-blocking, ` +
-      `${dropped.length} dropped, ${outcome.turns} turns, $${outcome.costUsd.toFixed(4)}` +
-      (outcome.hadRepoInstructions ? ', repo OJ.md applied' : ''),
+    `${key}: round ${round} ${postedEvent ?? 'COMMENT'} in ${seconds}s — ` +
+      `verdict ${ledger.verdict ?? 'none'}` +
+      (decision.downgraded ? ` (capped from ${decision.wanted})` : '') +
+      `, ${ledger.comments.length} comment(s), ${ledger.issues.length} issue(s), ` +
+      `${outcome.turns} turns, $${outcome.costUsd.toFixed(4)}` +
+      (outcome.hadRepoInstructions ? ', repo OJ.md applied' : '') +
+      (outcome.caveat ? ` — ${outcome.caveat}` : ''),
   );
 }
 

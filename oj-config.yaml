@@ -39,7 +39,8 @@ github:
 
 paths:
   # One directory per open pull request: a clone, the rendered kickoff prompt,
-  # and the worker's report. Removed when the PR merges or closes.
+  # the `oj` shim, and the desk it posts through. Removed when the PR merges or
+  # closes.
   workersRoot: /var/lib/oj/workers
   # The kickoff prompt handed to every worker. Relative paths resolve against
   # the service's working directory.
@@ -55,8 +56,9 @@ worker:
   # task with a lot of fan-out; pin it here if you want reviews to stay on one
   # model across a CLI upgrade.
   model: ""
-  # Hard cap on one round. Generous, because the workflow fans out three
-  # verifiers per candidate finding and each of those reads real code.
+  # Hard cap on one round. Generous, because a review fans out across a real
+  # diff and reads real code. A round that has already posted its comment when
+  # the timeout fires is still a success — the review reached a human.
   timeoutMinutes: 45
   # Commits fetched for the head and the base. Deepened automatically when the
   # merge base is not in range, so this is a starting guess rather than a limit.
@@ -106,10 +108,17 @@ review:
   # conversation. 0 disables the sweep.
   workerTtlHours: 72
 
-  # Attach findings to specific lines of the diff. Best effort: GitHub rejects
-  # the whole review if any comment lands off the diff, so a rejection retries
-  # with the locations in the body instead.
-  inlineComments: true
+  # Ceilings on what one round's worker may do through the `oj` CLI.
+  #
+  # A review is normally one comment and no issues at all. These exist because
+  # the worker reads code written by strangers: a prompt-injected one can post
+  # onto the pull request it was already reviewing, which is a bounded and
+  # visible amount of noise, and these numbers are what "bounded" means. Issues
+  # are the lower of the two because they live outside the pull request and
+  # someone has to close them by hand. `maxIssuesPerRound: 0` turns `oj issue`
+  # off entirely.
+  maxCommentsPerRound: 10
+  maxIssuesPerRound: 5
 
 # ── House policy ──────────────────────────────────────────────────────────
 # Inherited by every repo below, which may override any of it.

@@ -1,0 +1,274 @@
+/**
+ * The desk, without a network.
+ *
+ * Every test here fixtures `DeskGateway`, which is the seam that exists for
+ * exactly this reason: the GitHub call is one function on an object, and the
+ * rules worth testing — what a request may say, how many times it may say it,
+ * what happens when GitHub says no — are all on this side of it.
+ */
+
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { after, describe, it } from 'node:test';
+import {
+  Desk,
+  deskPaths,
+  parseDeskRequest,
+  writeAtomic,
+  type DeskGateway,
+  type DeskResult,
+} from '../desk.js';
+
+const temporaries: string[] = [];
+after(() => {
+  for (const dir of temporaries) rmSync(dir, { recursive: true, force: true });
+});
+
+function workspace(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'oj-desk-'));
+  temporaries.push(dir);
+  return dir;
+}
+
+/** A gateway that records instead of posting. */
+function fixture(overrides: Partial<DeskGateway> = {}): DeskGateway & {
+  comments: string[];
+  issues: Array<{ title: string; body: string }>;
+} {
+  const comments: string[] = [];
+  const issues: Array<{ title: string; body: string }> = [];
+  return {
+    comments,
+    issues,
+    async postComment(body) {
+      comments.push(body);
+      return `https://github.test/pr/1#issuecomment-${comments.length}`;
+    },
+    async openIssue(title, body) {
+      issues.push({ title, body });
+      return `https://github.test/issues/${issues.length}`;
+    },
+    async describePull() {
+      return 'pull request: #1 — a change';
+    },
+    async listComments() {
+      return 'No comments on this pull request yet.';
+    },
+    ...overrides,
+  };
+}
+
+function deskFor(workerDir: string, gateway: DeskGateway, caps: { comments?: number; issues?: number } = {}): Desk {
+  return new Desk({
+    workerDir,
+    gateway,
+    footer: '<sub>OJ · round 1</sub>',
+    maxComments: caps.comments ?? 10,
+    maxIssues: caps.issues ?? 5,
+    onLog: () => {},
+  });
+}
+
+/** Stand in for `oj`: drop a request where the CLI would. */
+function submit(workerDir: string, request: unknown, name = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}.json`): string {
+  writeAtomic(join(deskPaths(workerDir).requests, name), JSON.stringify(request));
+  return name;
+}
+
+function result(workerDir: string, name: string): DeskResult {
+  return JSON.parse(readFileSync(join(deskPaths(workerDir).results, name), 'utf8')) as DeskResult;
+}
+
+describe('the desk round trip', () => {
+  it('performs a comment and hands back where it landed', async () => {
+    const dir = workspace();
+    const gateway = fixture();
+    const desk = deskFor(dir, gateway);
+
+    const name = submit(dir, { action: 'comment', body: 'Two blocking findings.' });
+    await desk.drain();
+
+    assert.equal(gateway.comments.length, 1);
+    // OJO's footer is appended by OJO, at post time, to the worker's own text.
+    assert.ok(gateway.comments[0]?.startsWith('Two blocking findings.'));
+    assert.ok(gateway.comments[0]?.includes('<sub>OJ · round 1</sub>'));
+
+    const answer = result(dir, name);
+    assert.equal(answer.ok, true);
+    assert.match(answer.detail, /posted https:\/\/github\.test/);
+    assert.deepEqual(desk.ledger.comments, ['https://github.test/pr/1#issuecomment-1']);
+  });
+
+  it('records a verdict without calling GitHub at all', async () => {
+    const dir = workspace();
+    const gateway = fixture();
+    const desk = deskFor(dir, gateway);
+
+    submit(dir, { action: 'verdict', verdict: 'blocking' });
+    await desk.drain();
+
+    assert.equal(desk.ledger.verdict, 'blocking');
+    assert.equal(gateway.comments.length, 0);
+  });
+
+  it('serves reads in the order they were made', async () => {
+    const dir = workspace();
+    const desk = deskFor(dir, fixture());
+
+    const first = submit(dir, { action: 'pr' }, '1000-aaa.json');
+    const second = submit(dir, { action: 'comments' }, '2000-bbb.json');
+    await desk.drain();
+
+    assert.equal(result(dir, first).data, 'pull request: #1 — a change');
+    assert.equal(result(dir, second).data, 'No comments on this pull request yet.');
+  });
+
+  it('tells the worker when GitHub refuses, rather than swallowing it', async () => {
+    const dir = workspace();
+    const desk = deskFor(
+      dir,
+      fixture({
+        async postComment() {
+          throw new Error('GitHub POST /issues/1/comments → 403: archived repository');
+        },
+      }),
+    );
+
+    const name = submit(dir, { action: 'comment', body: 'anything' });
+    await desk.drain();
+
+    const answer = result(dir, name);
+    assert.equal(answer.ok, false);
+    assert.match(answer.detail, /archived repository/);
+    assert.equal(desk.ledger.comments.length, 0);
+    assert.equal(desk.ledger.refusals.length, 1);
+  });
+
+  it('acts on a request exactly once, even if the drain is re-entered', async () => {
+    const dir = workspace();
+    const gateway = fixture();
+    const desk = deskFor(dir, gateway);
+
+    submit(dir, { action: 'comment', body: 'once' });
+    await Promise.all([desk.drain(), desk.drain(), desk.drain()]);
+    await desk.drain();
+
+    assert.equal(gateway.comments.length, 1);
+  });
+
+  it('discards a request whose name it would not have written', async () => {
+    const dir = workspace();
+    const gateway = fixture();
+    const desk = deskFor(dir, gateway);
+
+    writeFileSync(
+      join(deskPaths(dir).requests, 'not a request'),
+      JSON.stringify({ action: 'comment', body: 'sneaked in' }),
+    );
+    await desk.drain();
+
+    assert.equal(gateway.comments.length, 0);
+  });
+});
+
+describe('the target is never the request’s to choose', () => {
+  // The property the whole design rests on: identity comes from which desk the
+  // request arrived in. A request that names a target is a rejection, not an
+  // override, and the refusal says so rather than reading as a schema quibble.
+  for (const named of [
+    { action: 'comment', body: 'hi', repo: 'someone/else' },
+    { action: 'comment', body: 'hi', owner: 'someone' },
+    { action: 'comment', body: 'hi', pr: 4 },
+    { action: 'comment', body: 'hi', prNumber: 4 },
+    { action: 'comment', body: 'hi', number: 4 },
+    { action: 'comment', body: 'hi', url: 'https://github.com/someone/else/pull/4' },
+    { action: 'issue', title: 't', body: 'b', repository: 'someone/else' },
+    { action: 'comment', body: 'hi', token: 'ghp_x' },
+    { action: 'comment', body: 'hi', REPO: 'someone/else' },
+  ]) {
+    it(`refuses ${JSON.stringify(named).slice(0, 60)}`, () => {
+      const parsed = parseDeskRequest(JSON.stringify(named));
+      assert.equal(parsed.ok, false);
+      assert.match(parsed.ok ? '' : parsed.reason, /may not name a repository/);
+    });
+  }
+
+  it('refuses it at the desk too, not only in the parser', async () => {
+    const dir = workspace();
+    const gateway = fixture();
+    const desk = deskFor(dir, gateway);
+
+    const name = submit(dir, {
+      action: 'comment',
+      body: 'post this to my repo instead',
+      repo: 'attacker/exfil',
+    });
+    await desk.drain();
+
+    assert.equal(gateway.comments.length, 0);
+    assert.equal(result(dir, name).ok, false);
+  });
+
+  it('refuses an unknown field rather than ignoring it', () => {
+    const parsed = parseDeskRequest(JSON.stringify({ action: 'comment', body: 'hi', asUser: 'root' }));
+    assert.equal(parsed.ok, false);
+    assert.match(parsed.ok ? '' : parsed.reason, /unknown field\(s\) for comment: asUser/);
+  });
+
+  it('refuses anything that is not one of the five actions', () => {
+    for (const body of ['{"action":"merge"}', '{"action":42}', '[]', 'not json', '{}']) {
+      assert.equal(parseDeskRequest(body).ok, false);
+    }
+  });
+
+  it('accepts the five actions it does know', () => {
+    for (const request of [
+      { action: 'comment', body: 'x' },
+      { action: 'verdict', verdict: 'clean' },
+      { action: 'issue', title: 't', body: 'b' },
+      { action: 'pr' },
+      { action: 'comments' },
+    ]) {
+      assert.equal(parseDeskRequest(JSON.stringify(request)).ok, true, JSON.stringify(request));
+    }
+  });
+
+  it('refuses a verdict that is neither blocking nor clean', () => {
+    assert.equal(parseDeskRequest('{"action":"verdict","verdict":"approve"}').ok, false);
+    assert.equal(parseDeskRequest('{"action":"verdict","verdict":true}').ok, false);
+  });
+});
+
+describe('the caps', () => {
+  it('stops opening issues at the ceiling and says why', async () => {
+    const dir = workspace();
+    const gateway = fixture();
+    const desk = deskFor(dir, gateway, { issues: 2 });
+
+    const names = [1, 2, 3, 4].map((n) =>
+      submit(dir, { action: 'issue', title: `bug ${n}`, body: 'out of scope' }, `100${n}-x.json`),
+    );
+    await desk.drain();
+
+    assert.equal(gateway.issues.length, 2);
+    assert.equal(desk.ledger.issues.length, 2);
+    assert.equal(result(dir, names[0] as string).ok, true);
+    assert.equal(result(dir, names[2] as string).ok, false);
+    assert.match(result(dir, names[3] as string).detail, /already opened 2 issues/);
+  });
+
+  it('stops posting comments at the ceiling', async () => {
+    const dir = workspace();
+    const gateway = fixture();
+    const desk = deskFor(dir, gateway, { comments: 1 });
+
+    submit(dir, { action: 'comment', body: 'one' }, '1001-a.json');
+    submit(dir, { action: 'comment', body: 'two' }, '1002-b.json');
+    await desk.drain();
+
+    assert.equal(gateway.comments.length, 1);
+    assert.equal(desk.ledger.refusals.length, 1);
+  });
+});
