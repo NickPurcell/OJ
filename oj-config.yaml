@@ -51,7 +51,12 @@ paths:
 worker:
   # Absolute: systemd hands services a minimal PATH, and a worker that cannot
   # be spawned looks exactly like a review that never finished.
-  claudePath: /usr/local/bin/claude
+  #
+  # This is where the CLI lives on the deployment, which is not where it lives
+  # in an agent's container. `/usr/local/bin/claude` was committed here and is
+  # wrong: it is the container path, written by someone reading their own
+  # filesystem. Check the host before changing it.
+  claudePath: /home/npurcell/.local/bin/claude
   # Empty means whatever the CLI is configured to use. Review is a reasoning
   # task with a lot of fan-out; pin it here if you want reviews to stay on one
   # model across a CLI upgrade.
@@ -130,7 +135,7 @@ defaults:
   # Review a pull request the first time OJ sees it, without waiting for the
   # label. Baselined on first sight of each repo, so turning this on does not
   # fan out across every pull request that is already open.
-  reviewNewPrs: false
+  reviewNewPrs: true
 
   # Drafts are usually still being written.
   reviewDrafts: false
@@ -150,6 +155,7 @@ defaults:
 # Either "owner/repo" or a mapping that overrides any policy key above.
 repos:
   - NickPurcell/OJ
+  - NickPurcell/Clawcius
 
   # - slug: NickPurcell/Clawcius
   #   reviewNewPrs: true
