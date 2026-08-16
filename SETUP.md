@@ -359,6 +359,16 @@ request that tried to name a target. If it shows `tool N Bash FAILED … require
 approval`, the post was refused by the permission system and never reached the
 desk.
 
+**`npm run build` prints nothing and exits non-zero, and the tests still pass.**
+Check for a `node_modules` **symlink** in the working tree — a git worktree
+borrowing another checkout's install is the usual way one appears, and if it
+ever points at itself, `tsc` dies with "too many levels of symbolic links" and
+exits 216 with an empty message. `npm test` is `npm run build && node --test
+dist/…`, so it stops there; but a test binary run directly gets a green result
+from whatever `dist/` was last built, which is worse than a red one. `rm -rf
+dist` before believing a suspicious pass. This happened on 2026-08-16, on this
+repository, inside the pull request about silent failures.
+
 **"the oj CLI is missing at …/dist/oj-cli.js".** OJO is running from source that
 was never built, or from a `dist/` predating the CLI. `npm run build`. The
 review is refused before the clone rather than after forty minutes, because a
