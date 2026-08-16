@@ -177,11 +177,14 @@ on at the bottom of a review.
 **Cleans up.** Merged or closed → the directory goes. Plus a TTL sweep for pull
 requests that went quiet without closing.
 
-**Fails loudly and specifically.** A round that posts nothing is reported on the
-pull request as `said-nothing`, which is a different diagnosis from `timeout` or
-`spawn-failed` — one means read the transcript, the others mean read the
-journal. A round that posted its review and *then* hit the timeout is a success,
-because the review reached a human.
+**Fails loudly and specifically.** A round that posts nothing is asked once more
+and, if it wrote its review to a file, has that review posted for it — losing
+fifteen minutes of findings because the last command never ran is not a failure
+mode worth keeping. Only a round that says nothing twice is reported as
+`said-nothing`, which is a different diagnosis from `timeout` or `spawn-failed`
+— one means read the transcript, the others mean read the journal. A round that
+posted its review and *then* hit the timeout is a success, because the review
+reached a human.
 
 ## Verdicts
 

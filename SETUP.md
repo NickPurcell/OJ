@@ -345,12 +345,19 @@ The journal shows no `tool …` lines at all in this case, which distinguishes i
 from a review that is merely slow.
 
 **"the worker finished without posting a comment" (`said-nothing`).** The
-session ran and decided it was done without running `oj comment`, so the round
-produced no review. Read `oj/kickoff-round-N.md` and the transcript; usually the
-kickoff has been edited into something ambiguous about what a round must
-produce. If the journal shows `oj comment: REFUSED`, the request was rejected
-and the reason is on that line — a per-round cap, or a request that tried to
-name a target.
+session ran and decided it was done without running `oj comment`. Before
+reporting this, OJO asks the session once more — you will see `the session ended
+without posting … asking once` and `oj/finish-round-N.md` on disk — and if the
+worker wrote `review.md`, OJO posts that itself rather than losing it, which
+shows up as a success with a caveat naming the file. So a genuine `said-nothing`
+means the round was asked twice and wrote nothing either time; the failure
+detail names every path that was checked. Read `oj/kickoff-round-N.md` and the
+transcript; usually the kickoff has been edited into something ambiguous about
+what a round must produce. If the journal shows `oj comment: REFUSED`, the
+request was rejected and the reason is on that line — a per-round cap, or a
+request that tried to name a target. If it shows `tool N Bash FAILED … requires
+approval`, the post was refused by the permission system and never reached the
+desk.
 
 **"the oj CLI is missing at …/dist/oj-cli.js".** OJO is running from source that
 was never built, or from a `dist/` predating the CLI. `npm run build`. The
