@@ -587,10 +587,17 @@ function buildFollowUp(
     '',
     'The pull request has been flagged ready for review again. The working tree has been',
     `reset and re-checked-out at ${pull.headSha}${previousSha ? `, up from ${previousSha}` : ''}.`,
-    'Anything you wrote inside the checkout is gone. If you left a review file in your working',
-    'directory, it has been moved into `oj/` and OJO will not read it — it reviews a commit that',
-    'is no longer here, so write a fresh one. The conversation above is intact, and so is',
-    'everything you concluded in it.',
+    // What was moved, and why, said only as far as it is true. `previousSha` is
+    // null when nobody can say the head changed — a re-label with no push gives
+    // this round the same commit — and the sentence four lines down admits
+    // exactly that. Claiming here that the old review is of "a commit that is no
+    // longer here" would contradict it in the same prompt.
+    'Anything you wrote inside the checkout is gone. If you left `review.md` or `oj/review.md`',
+    `in your working directory, it has been moved into \`oj/\` and OJO will not read it: it is ${
+      previousSha ? 'a review of an earlier commit' : "the previous round's work, not this one's"
+    },`,
+    'so write a fresh one. Anything you left under another name is untouched, and OJO will not',
+    'read that either. The conversation above is intact, and so is everything you concluded in it.',
     '',
     previousSha
       ? `What changed since you last looked:\n\n    git -C ${clone.repoDir} diff ${previousSha}..${pull.headSha}\n`
@@ -1345,11 +1352,22 @@ const REVIEW_FILE_CANDIDATES = ['review.md', join('oj', 'review.md')] as const;
 export type ReviewFileNote = { path: string; kind: 'stale' | 'unusable'; text: string };
 
 export type ReviewFileSearch = {
-  found: { path: string; body: string } | null;
+  /** `mtimeMs` so a failure comment can name where the next round will put it. */
+  found: { path: string; body: string; mtimeMs: number } | null;
   /** Every path considered, so a failure can name them instead of shrugging. */
   checked: string[];
   notes: ReviewFileNote[];
 };
+
+/** One line of the account, with the distinction `buildFinishPrompt` turns on. */
+function note(
+  search: ReviewFileSearch,
+  path: string,
+  kind: ReviewFileNote['kind'],
+  text: string,
+): void {
+  search.notes.push({ path, kind, text: `${path} ${text}` });
+}
 
 /**
  * Find the review a finished session left on disk.
@@ -1363,15 +1381,6 @@ export type ReviewFileSearch = {
  * applies to its request files and for the same reason: this file's contents are
  * about to be posted publicly, and the worker chooses the name.
  */
-function note(
-  search: ReviewFileSearch,
-  path: string,
-  kind: ReviewFileNote['kind'],
-  text: string,
-): void {
-  search.notes.push({ path, kind, text: `${path} ${text}` });
-}
-
 export function findWrittenReview(workerDir: string, writtenSince: number): ReviewFileSearch {
   const search: ReviewFileSearch = { found: null, checked: [], notes: [] };
   for (const candidate of REVIEW_FILE_CANDIDATES) {
@@ -1384,10 +1393,11 @@ export function findWrittenReview(workerDir: string, writtenSince: number): Revi
     } catch {
       continue;
     }
-    if (!stat.isFile()) {
-      note(search, path, 'unusable', 'is not a regular file, so it was not read');
-      continue;
-    }
+    // AGE BEFORE SHAPE. `unusable` means "this round's work, and the handover
+    // failed", which is what makes `buildFinishPrompt` say "you wrote a review
+    // file this round". Asking about the shape first labelled an *earlier*
+    // round's symlink or directory that way, and told the worker it had written
+    // something it had not.
     if (stat.mtimeMs < writtenSince) {
       note(
         search,
@@ -1396,6 +1406,10 @@ export function findWrittenReview(workerDir: string, writtenSince: number): Revi
         `was last written ${new Date(stat.mtimeMs).toISOString()}, before this round started — ` +
           'it belongs to an earlier round and was left alone',
       );
+      continue;
+    }
+    if (!stat.isFile()) {
+      note(search, path, 'unusable', 'is not a regular file, so it was not read');
       continue;
     }
     if (stat.size > MAX_REQUEST_BYTES) {
@@ -1414,7 +1428,7 @@ export function findWrittenReview(workerDir: string, writtenSince: number): Revi
       note(search, path, 'unusable', 'is empty');
       continue;
     }
-    if (!search.found) search.found = { path, body };
+    if (!search.found) search.found = { path, body, mtimeMs: stat.mtimeMs };
   }
   return search;
 }
@@ -1438,6 +1452,24 @@ export function findWrittenReview(workerDir: string, writtenSince: number): Revi
  * comment promises it is still there, and `<workerDir>/oj` is where this service
  * already keeps the round's paper trail.
  */
+/**
+ * Where a stale review goes, as a function rather than a string built twice.
+ *
+ * The candidate's own name is in it, not only the timestamp: both candidates can
+ * be written in the same millisecond, and `renameSync` overwrites, so a stamp
+ * alone silently collapses two archives into one while the caller reports both
+ * as kept.
+ *
+ * Shared with `reviewFileAccount`, which is the reason this is exported at all:
+ * a failure comment that promises the file is still at `review.md` is wrong the
+ * moment the next round runs, so the comment names the path it will have then.
+ */
+export function archivedReviewPath(workerDir: string, candidate: string, mtimeMs: number): string {
+  const stamp = new Date(mtimeMs).toISOString().replace(/[:.]/g, '-');
+  const from = candidate.split(sep).join('-');
+  return join(workerDir, 'oj', `review-superseded-${stamp}-${from}`);
+}
+
 export function archiveStaleReviews(workerDir: string, before: number): string[] {
   const archived: string[] = [];
   for (const candidate of REVIEW_FILE_CANDIDATES) {
@@ -1449,8 +1481,7 @@ export function archiveStaleReviews(workerDir: string, before: number): string[]
       continue;
     }
     if (!stat.isFile() || stat.mtimeMs >= before) continue;
-    const stamp = new Date(stat.mtimeMs).toISOString().replace(/[:.]/g, '-');
-    const target = join(workerDir, 'oj', `review-superseded-${stamp}.md`);
+    const target = archivedReviewPath(workerDir, candidate, stat.mtimeMs);
     try {
       mkdirSync(join(workerDir, 'oj'), { recursive: true });
       renameSync(path, target);
@@ -1618,6 +1649,7 @@ function saidNothingDetail(
   followUp: SpawnOutcome | null,
   recoveryError: string | null,
   ledger: DeskLedger,
+  workerDir: string,
 ): string {
   const lines = ['the worker finished without posting a comment, so this round produced no review.'];
   if (followUp?.timedOut) {
@@ -1634,7 +1666,7 @@ function saidNothingDetail(
   } else if (followUp) {
     lines.push('OJO asked once more, in the same session, and it still posted nothing.');
   }
-  lines.push(...reviewFileAccount(search, recoveryError));
+  lines.push(...reviewFileAccount(search, recoveryError, workerDir));
   if (ledger.refusals.length > 0) {
     lines.push('', 'Requests refused this round:', ...ledger.refusals);
   }
@@ -1649,13 +1681,24 @@ function saidNothingDetail(
  * review behind, and "we looked here and here, and this is what we found" is the
  * sentence that decides whether anyone goes and looks.
  */
-function reviewFileAccount(search: ReviewFileSearch | null, recoveryError: string | null): string[] {
+function reviewFileAccount(
+  search: ReviewFileSearch | null,
+  recoveryError: string | null,
+  workerDir: string,
+): string[] {
   if (!search) return [];
   if (search.found) {
+    // Name BOTH paths. This comment ends by telling a human to re-add the label,
+    // and the round that follows begins by moving this file — so "it is still at
+    // review.md" is a promise that expires the moment the instruction beneath it
+    // is followed. Sending someone to a path that will ENOENT is worse than
+    // sending them nowhere.
+    const archive = archivedReviewPath(workerDir, relative(workerDir, search.found.path), search.found.mtimeMs);
     return recoveryError
       ? [
           `Its review was on disk at ${search.found.path} and OJO could not post it either: ${recoveryError}`,
-          'The file is still there until the pull request closes or the sweep reclaims it.',
+          `The file is kept. Re-adding the label starts a round that moves it to ${archive} ` +
+            'before it does anything else, so look for it under that name afterwards.',
         ]
       : [`Its review is on disk at ${search.found.path}.`];
   }
@@ -1848,7 +1891,7 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
           `the worker exceeded ${request.config.worker.timeoutMinutes} minutes and was killed ` +
             'before it posted anything. The session is intact, so re-labelling the PR resumes ' +
             'it rather than starting over.',
-          ...reviewFileAccount(search, recoveryError),
+          ...reviewFileAccount(search, recoveryError, workerDir),
         ].join('\n'),
         workerDir,
         durationMs,
@@ -1860,10 +1903,10 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
       reason: outcome.code === 0 ? 'said-nothing' : 'spawn-failed',
       detail:
         outcome.code === 0
-          ? saidNothingDetail(search, followUp, recoveryError, ledger)
+          ? saidNothingDetail(search, followUp, recoveryError, ledger, workerDir)
           : [
               `claude exited ${outcome.code ?? outcome.signal}: ${outcome.stderr.trim().slice(0, 500)}`,
-              ...reviewFileAccount(search, recoveryError),
+              ...reviewFileAccount(search, recoveryError, workerDir),
             ].join('\n'),
       workerDir,
       durationMs,

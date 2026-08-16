@@ -10,6 +10,8 @@
 import assert from 'node:assert/strict';
 import {
   existsSync,
+  lstatSync,
+  lutimesSync,
   mkdirSync,
   readdirSync,
   mkdtempSync,
@@ -26,6 +28,7 @@ import type { OjConfig, RepoConfig } from '../config.js';
 import { deskPaths } from '../desk.js';
 import type { PullRequest } from '../github.js';
 import {
+  archivedReviewPath,
   archiveStaleReviews,
   createStreamMonitor,
   findWrittenReview,
@@ -382,6 +385,22 @@ describe('findWrittenReview', () => {
     );
   });
 
+  it('calls an earlier round’s symlink stale, not something this round wrote', () => {
+    // Age before shape. `unusable` is what makes the follow-up prompt say "you
+    // wrote a review file this round", and an earlier round's leftovers are not
+    // this round's work whatever shape they are in.
+    const workerDir = workerDirWith({ 'elsewhere.md': 'not mine' });
+    symlinkSync(join(workerDir, 'elsewhere.md'), join(workerDir, 'review.md'));
+    const old = new Date(Date.now() - 86_400_000);
+    // lutimes, not utimes: utimes follows the link and would date the target.
+    lutimesSync(join(workerDir, 'review.md'), old, old);
+
+    const search = findWrittenReview(workerDir, Date.now() - 60_000);
+
+    assert.equal(search.found, null);
+    assert.equal(search.notes[0]?.kind, 'stale');
+  });
+
   it('names every path it looked at, so a failure can say so', () => {
     const workerDir = workerDirWith({ 'review.md': '   \n' });
 
@@ -423,6 +442,45 @@ describe('archiveStaleReviews', () => {
     assert.equal(kept.length, 1);
     assert.match(kept[0] ?? '', /^review-superseded-/);
     assert.equal(readFileSync(join(workerDir, 'oj', kept[0] as string), 'utf8'), 'round one');
+  });
+
+  it('keeps both archives when two files share a millisecond', () => {
+    // `renameSync` overwrites, so a name built from the timestamp alone loses
+    // one of them while the caller reports both as kept.
+    const workerDir = workerDirWith({ 'review.md': 'root one', 'oj/review.md': 'nested one' });
+    const old = new Date(Date.now() - 86_400_000);
+    for (const name of ['review.md', join('oj', 'review.md')]) {
+      utimesSync(join(workerDir, name), old, old);
+    }
+
+    const moved = archiveStaleReviews(workerDir, Date.now() - 60_000);
+
+    assert.equal(moved.length, 2);
+    const kept = readdirSync(join(workerDir, 'oj')).sort();
+    assert.equal(kept.length, 2, 'one archive overwrote the other');
+    assert.deepEqual(
+      kept.map((name) => readFileSync(join(workerDir, 'oj', name), 'utf8')).sort(),
+      ['nested one', 'root one'],
+    );
+  });
+
+  it('puts a stale review where the failure comment said it would', () => {
+    // The failure comment names this path, and a human follows it after
+    // re-labelling. The two must be one function, and they are.
+    const workerDir = workerDirWith({ 'review.md': 'round one' });
+    const old = new Date(Date.now() - 86_400_000);
+    utimesSync(join(workerDir, 'review.md'), old, old);
+    // From the same source the failure comment uses: what the filesystem
+    // reports, not what we asked it to store.
+    const promised = archivedReviewPath(
+      workerDir,
+      'review.md',
+      lstatSync(join(workerDir, 'review.md')).mtimeMs,
+    );
+
+    archiveStaleReviews(workerDir, Date.now() - 60_000);
+
+    assert.equal(readFileSync(promised, 'utf8'), 'round one');
   });
 
   it('leaves this round’s own review exactly where the worker put it', () => {
