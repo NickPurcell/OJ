@@ -766,7 +766,6 @@ type SpawnOutcome = {
   stderr: string;
   costUsd: number;
   turns: number;
-  resultIsError: boolean;
 };
 
 /**
@@ -843,12 +842,16 @@ function workerPermissionSettings(): string {
  * the one shape that explains a long silence from outside the session, and it
  * was unobtainable before.
  *
- * On arguments and privacy. The reviewed repository's *contents* still do not
- * reach the journal: fields are named individually (`command`, `file_path`,
- * `pattern`) and `content`, `new_string` and `prompt` are deliberately not among
- * them, so a Write is logged as its path and never as its text. What does reach
- * the journal is what the reviewer chose to do, on our own host, to our own
- * repositories. Withholding that cost three days.
+ * On arguments and privacy, stated exactly, because an operator will read this
+ * to decide whether `journalctl` output is safe to paste somewhere. NO TOOL
+ * INPUT FIELD THAT CARRIES FILE CONTENTS IS LOGGED: the fields are named
+ * individually below, and `content`, `new_string` and `prompt` are deliberately
+ * not among them, so a Write is its path and never its text. THE OUTPUT OF A
+ * FAILED CALL IS LOGGED, up to `TOOL_RESULT_CHARS`, and that is not
+ * content-free: `git diff --exit-code` fails and prints the diff, a failing test
+ * prints the source lines it asserted on. That is the point of the change — a
+ * denial and a wedge are both diagnosed from what came back — but it is a
+ * trade, and on a private repository it is the operator's to know about.
  */
 const LOGGED_TOOL_FIELDS = [
   'command',
@@ -864,6 +867,9 @@ const LOGGED_TOOL_FIELDS = [
 
 /** Long enough for a real `git diff` invocation, short enough to stay one line. */
 const TOOL_ARGUMENT_CHARS = 200;
+
+/** How much of a FAILED call's output is kept. See the note on contents above. */
+const TOOL_RESULT_CHARS = 200;
 
 function oneLine(text: string, limit: number): string {
   const flat = text.replace(/\s+/g, ' ').trim();
@@ -918,7 +924,6 @@ function toolResultText(content: unknown): string {
 export type StreamTotals = {
   costUsd: number;
   turns: number;
-  resultIsError: boolean;
   /** How many `result` messages this process emitted. More than one is normal; see below. */
   results: number;
 };
@@ -954,7 +959,12 @@ export type StreamMonitor = {
  *
  * That is why the totals below take the MAXIMUM over results that actually carry
  * usage, instead of the last one: last-write-wins would report a task
- * notification's four cents as the round's cost. It is also why every result is
+ * notification's four cents as the round's cost. Whether a later result within
+ * one process restates the whole process's spend or only its own turn was NOT
+ * established — the maximum is right either way, which is why it is the maximum
+ * and not a sum. Across two processes the costs are separate, and that WAS
+ * checked: a resumed invocation reported its own spend and not the earlier
+ * one's, so `combineOutcomes` adds them. It is also why every result is
  * logged with its `origin`, `session_id`, `stop_reason` and `terminal_reason`,
  * and why one that carries no usage fields is logged RAW. The next occurrence
  * should end that question rather than reopen it.
@@ -963,7 +973,7 @@ export type StreamMonitor = {
  * the stream, and the round ends when the process does.
  */
 export function createStreamMonitor(onProgress: (line: string) => void): StreamMonitor {
-  const totals: StreamTotals = { costUsd: 0, turns: 0, resultIsError: false, results: 0 };
+  const totals: StreamTotals = { costUsd: 0, turns: 0, results: 0 };
   const open = new Map<string, { seq: number; name: string; arguments: string; startedAt: number }>();
   const seenSystemSubtypes = new Set<string>();
   let calls = 0;
@@ -1007,7 +1017,7 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
       // exit arrives as exactly this, with the shell's own output in the text,
       // and so does a permission denial — which is the case that was invisible.
       const failed = item.is_error === true;
-      const detail = failed ? ` — ${oneLine(toolResultText(item.content), 200)}` : '';
+      const detail = failed ? ` — ${oneLine(toolResultText(item.content), TOOL_RESULT_CHARS)}` : '';
       onProgress(
         `tool ${call?.seq ?? '?'} ${call?.name ?? 'unknown'} ${failed ? 'FAILED' : 'ok'} ` +
           `in ${seconds}s${detail}`,
@@ -1036,6 +1046,12 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
     // means the session is about to sit still, which is one of the few honest
     // explanations for a long gap between two lines of this journal.
     if (!status || status === 'allowed') return;
+    // `resetsAt` is UNIX SECONDS. Checked rather than assumed, against a real
+    // 2.1.220 event: 1786910400, which is 2026-08-16T20:00:00Z — a five-hour
+    // window boundary. Read as milliseconds the same number is 1970-01-21, and
+    // the mistake in the other direction prints a date in the year 58000. A
+    // journal that states a confident wrong fact is worse than one that omits
+    // it, so the unit is pinned by a test.
     const resets = info?.resetsAt ? `, resets ${new Date(info.resetsAt * 1000).toISOString()}` : '';
     onProgress(`rate limit: ${status}${resets}`);
   };
@@ -1057,7 +1073,6 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
 
     totals.turns = Math.max(totals.turns, turns);
     totals.costUsd = Math.max(totals.costUsd, cost);
-    totals.resultIsError = message['is_error'] === true;
 
     const origin = message['origin'];
     const denials = Array.isArray(message['permission_denials'])
@@ -1240,7 +1255,6 @@ function spawnClaude(
               stderr: `${stderr}\nworker did not exit after SIGKILL; abandoned`,
               costUsd: monitor.totals.costUsd,
               turns: monitor.totals.turns,
-              resultIsError: true,
             }),
           15_000,
         ).unref();
@@ -1269,7 +1283,6 @@ function spawnClaude(
         stderr: `${stderr}\n${error.message}`,
         costUsd: monitor.totals.costUsd,
         turns: monitor.totals.turns,
-        resultIsError: true,
       });
     });
 
@@ -1281,7 +1294,6 @@ function spawnClaude(
         stderr,
         costUsd: monitor.totals.costUsd,
         turns: monitor.totals.turns,
-        resultIsError: monitor.totals.resultIsError,
       });
     });
   });
@@ -1402,6 +1414,17 @@ function buildFinishPrompt(search: ReviewFileSearch): string {
       '',
       'then record the verdict with `oj verdict blocking` or `oj verdict clean`.',
     );
+  } else if (search.notes.length > 0) {
+    // A file was there and OJO would not read it. Saying which, and why, is the
+    // difference between fixing one line and re-deriving a whole review: the
+    // work is on disk and only the handover failed.
+    lines.push(
+      'A review file is on disk but OJO will not use it:',
+      ...search.notes.map((note) => `  - ${note}`),
+      '',
+      'Fix that and post it, or post the text directly — `oj comment` takes the body on stdin',
+      'or `--file PATH` — and then record the verdict.',
+    );
   } else {
     lines.push(
       `Nothing was written to ${search.checked.join(' or ')}, so what you found is only in this`,
@@ -1423,20 +1446,22 @@ function buildFinishPrompt(search: ReviewFileSearch): string {
  * against the CLI, a resumed invocation reports what that invocation spent
  * rather than the conversation's running total — so the round's cost is the sum.
  *
- * The exit code stays the FIRST one. That code is what classifies the round
- * (`said-nothing` versus `spawn-failed`), and a follow-up turn that fails to
- * start must not relabel a session that ended cleanly; it goes into stderr,
- * where the detail string will show it.
+ * HOW THE ROUND ENDED IS THE FIRST PROCESS'S ANSWER, both the exit code and the
+ * timeout flag. Those two classify the round, and the follow-up is a postscript:
+ * a turn that fails to start must not turn a session that ended cleanly into
+ * `spawn-failed`, and a follow-up killed by its own ten-minute cap must not
+ * report the round as having "exceeded 45 minutes" when it exceeded nothing.
+ * The follow-up's own fate is reported through `stderr` and by the caller, which
+ * holds both outcomes and can say what happened to each.
  */
 function combineOutcomes(round: SpawnOutcome, followUp: SpawnOutcome): SpawnOutcome {
   return {
     code: round.code,
     signal: round.signal,
-    timedOut: round.timedOut || followUp.timedOut,
+    timedOut: round.timedOut,
     stderr: [round.stderr, followUp.stderr].filter((text) => text.trim().length > 0).join('\n'),
     costUsd: round.costUsd + followUp.costUsd,
     turns: round.turns + followUp.turns,
-    resultIsError: followUp.resultIsError,
   };
 }
 
@@ -1474,27 +1499,51 @@ function recoveredCommentBody(review: { path: string; body: string }, footer: st
  */
 function saidNothingDetail(
   search: ReviewFileSearch | null,
-  asked: boolean,
+  followUp: SpawnOutcome | null,
   recoveryError: string | null,
   ledger: DeskLedger,
 ): string {
   const lines = ['the worker finished without posting a comment, so this round produced no review.'];
-  if (asked) lines.push('OJO asked once more, in the same session, and it still posted nothing.');
-  if (search?.found && recoveryError) {
+  if (followUp?.timedOut) {
+    lines.push('OJO asked once more; that turn hit its own timeout and was killed.');
+  } else if (followUp && followUp.code !== 0) {
     lines.push(
-      `Its review was on disk at ${search.found.path} and OJO could not post it either: ${recoveryError}`,
+      `OJO asked once more; that turn exited ${followUp.code ?? followUp.signal} without ` +
+        `starting: ${followUp.stderr.trim().slice(0, 300)}`,
     );
-  } else if (search) {
-    lines.push(
-      `No review file was written this round. Checked: ${search.checked.join(', ')}.`,
-      ...search.notes,
-      'Findings, if there were any, are in the session transcript.',
-    );
+  } else if (followUp) {
+    lines.push('OJO asked once more, in the same session, and it still posted nothing.');
   }
+  lines.push(...reviewFileAccount(search, recoveryError));
   if (ledger.refusals.length > 0) {
     lines.push('', 'Requests refused this round:', ...ledger.refusals);
   }
   return lines.join('\n');
+}
+
+/**
+ * What was on disk, for the human reading the failure.
+ *
+ * Appended to every failure that posted nothing, not just `said-nothing`: a
+ * round killed by the timeout is the likeliest of all to have left a finished
+ * review behind, and "we looked here and here, and this is what we found" is the
+ * sentence that decides whether anyone goes and looks.
+ */
+function reviewFileAccount(search: ReviewFileSearch | null, recoveryError: string | null): string[] {
+  if (!search) return [];
+  if (search.found) {
+    return recoveryError
+      ? [
+          `Its review was on disk at ${search.found.path} and OJO could not post it either: ${recoveryError}`,
+          'The file is still there until the pull request closes or the sweep reclaims it.',
+        ]
+      : [`Its review is on disk at ${search.found.path}.`];
+  }
+  return [
+    `No review file was written this round. Checked: ${search.checked.join(', ')}.`,
+    ...search.notes,
+    'Findings, if there were any, are in the session transcript.',
+  ];
 }
 
 // ── the whole round ──────────────────────────────────────────────────────────
@@ -1552,7 +1601,12 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
 
   let outcome: SpawnOutcome;
   let search: ReviewFileSearch | null = null;
-  let asked = false;
+  let followUp: SpawnOutcome | null = null;
+  const lookForReview = (): ReviewFileSearch => {
+    const result = findWrittenReview(workerDir, startedAt);
+    for (const note of result.notes) request.onProgress?.(`review file: ${note}`);
+    return result;
+  };
   try {
     desk.start();
     outcome = await spawnClaude(request, workerDir, prompt, !firstRound, binDir);
@@ -1574,36 +1628,53 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
     // by a timer that runs twice a second, and deciding "said nothing" against a
     // stale ledger would ask a worker that just posted to post again.
     await desk.drain();
-    if (ledger.comments.length === 0 && !outcome.timedOut && outcome.code === 0) {
-      search = findWrittenReview(workerDir, startedAt);
-      for (const note of search.notes) request.onProgress?.(`review file: ${note}`);
-      request.onProgress?.(
-        search.found
-          ? `the session ended without posting, and ${search.found.path} was written this round — asking once`
-          : 'the session ended without posting, and wrote no review file — asking once',
-      );
+    if (ledger.comments.length === 0) {
+      // Looked for on EVERY silent exit, not only the clean ones. A worker
+      // killed by the round timeout at minute 45, or one whose session died in
+      // a wedged tool call, is the likeliest of all to have a finished
+      // `review.md` and no comment — and the file is lost for good if this
+      // round ignores it, because the next round refuses it by mtime and the
+      // TTL sweep takes the directory. Reading a file costs nothing.
+      search = lookForReview();
 
-      const finishPrompt = buildFinishPrompt(search);
-      writeFileSync(join(workerDir, 'oj', `finish-round-${request.round}.md`), finishPrompt);
-      asked = true;
-      // A short timeout of its own. This is one turn of one comment, and the
-      // round has already spent its budget; if it needs the full forty-five
-      // minutes then something is wrong that a longer wait will not fix.
-      const followUp = await spawnClaude(
-        request,
-        workerDir,
-        finishPrompt,
-        true,
-        binDir,
-        Math.min(10, request.config.worker.timeoutMinutes),
-      );
-      if (followUp.code !== 0) {
+      // Only the extra process is gated on a clean exit: asking a session that
+      // was killed, or that could not start, to take another turn is asking a
+      // question there is nobody left to answer.
+      if (!outcome.timedOut && outcome.code === 0) {
         request.onProgress?.(
-          `the follow-up turn exited ${followUp.code ?? followUp.signal}: ` +
-            followUp.stderr.trim().slice(0, 200),
+          search.found
+            ? `the session ended without posting, and ${search.found.path} was written this round — asking once`
+            : 'the session ended without posting, and wrote no review file — asking once',
         );
+
+        const finishPrompt = buildFinishPrompt(search);
+        writeFileSync(join(workerDir, 'oj', `finish-round-${request.round}.md`), finishPrompt);
+        // A short timeout of its own. This is one turn of one comment, and the
+        // round has already spent its budget; if it needs the full forty-five
+        // minutes then something is wrong that a longer wait will not fix.
+        followUp = await spawnClaude(
+          request,
+          workerDir,
+          finishPrompt,
+          true,
+          binDir,
+          Math.min(10, request.config.worker.timeoutMinutes),
+        );
+        if (followUp.code !== 0) {
+          request.onProgress?.(
+            `the follow-up turn exited ${followUp.code ?? followUp.signal}: ` +
+              followUp.stderr.trim().slice(0, 200),
+          );
+        }
+        outcome = combineOutcomes(outcome, followUp);
+        // And look again. The follow-up is told it may write the review out and
+        // post it; if it does the first and not the second, the file on disk is
+        // newer than the one read a moment ago — and reporting "no review file
+        // was written" with one sitting beside the report would be the same
+        // loss a second time.
+        await desk.drain();
+        if (ledger.comments.length === 0) search = lookForReview();
       }
-      outcome = combineOutcomes(outcome, followUp);
     }
   } finally {
     // One last drain, always: a comment written in the session's final second
@@ -1644,10 +1715,12 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
       return {
         ok: false,
         reason: 'timeout',
-        detail:
+        detail: [
           `the worker exceeded ${request.config.worker.timeoutMinutes} minutes and was killed ` +
-          'before it posted anything. The session is intact, so re-labelling the PR resumes ' +
-          'it rather than starting over.',
+            'before it posted anything. The session is intact, so re-labelling the PR resumes ' +
+            'it rather than starting over.',
+          ...reviewFileAccount(search, recoveryError),
+        ].join('\n'),
         workerDir,
         durationMs,
         ledger,
@@ -1658,8 +1731,11 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
       reason: outcome.code === 0 ? 'said-nothing' : 'spawn-failed',
       detail:
         outcome.code === 0
-          ? saidNothingDetail(search, asked, recoveryError, ledger)
-          : `claude exited ${outcome.code ?? outcome.signal}: ${outcome.stderr.trim().slice(0, 500)}`,
+          ? saidNothingDetail(search, followUp, recoveryError, ledger)
+          : [
+              `claude exited ${outcome.code ?? outcome.signal}: ${outcome.stderr.trim().slice(0, 500)}`,
+              ...reviewFileAccount(search, recoveryError),
+            ].join('\n'),
       workerDir,
       durationMs,
       ledger,
@@ -1667,14 +1743,21 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
   }
 
   const caveats: string[] = [];
-  if (outcome.timedOut) caveats.push('the worker was killed by the round timeout after posting');
-  else if (outcome.code !== 0) caveats.push(`claude exited ${outcome.code ?? outcome.signal} after posting`);
   if (recovered) {
-    caveats.push(
-      `the worker never posted; OJO recovered the review from ${recovered} and posted it`,
-    );
-  } else if (asked) {
-    caveats.push('the worker posted only after OJO asked a second time');
+    // How the round ended matters more when OJO had to do the posting: a review
+    // recovered from a session that was killed may have been half-written.
+    const ending = outcome.timedOut
+      ? 'the worker was killed by the round timeout'
+      : outcome.code !== 0
+        ? `claude exited ${outcome.code ?? outcome.signal}`
+        : 'the worker never posted';
+    caveats.push(`${ending}; OJO recovered the review from ${recovered} and posted it`);
+  } else {
+    if (outcome.timedOut) caveats.push('the worker was killed by the round timeout after posting');
+    else if (outcome.code !== 0) {
+      caveats.push(`claude exited ${outcome.code ?? outcome.signal} after posting`);
+    }
+    if (followUp) caveats.push('the worker posted only after OJO asked a second time');
   }
   if (ledger.verdict === null) caveats.push('no verdict was recorded, so the review posts as a COMMENT');
   if (ledger.refusals.length > 0) caveats.push(`${ledger.refusals.length} desk request(s) refused`);

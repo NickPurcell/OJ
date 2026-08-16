@@ -295,6 +295,18 @@ describe('createStreamMonitor', () => {
     assert.ok(logged.some((line) => line === 'session compact_boundary'));
     assert.ok(logged.some((line) => line.includes('1 permission denial(s): Bash')));
   });
+
+  it('reads resetsAt as unix seconds, which is what the CLI sends', () => {
+    // 1786910400 is a real value from a 2.1.220 `rate_limit_event`, and it is a
+    // five-hour window boundary in 2026. Read as milliseconds it is 1970; the
+    // reverse mistake prints the year 58000. Either way the journal would be
+    // stating a wrong fact confidently, so the unit is pinned here.
+    const { logged } = monitorOver([
+      { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1786910400 } },
+    ]);
+
+    assert.equal(logged[0], 'rate limit: rejected, resets 2026-08-16T20:00:00.000Z');
+  });
 });
 
 describe('findWrittenReview', () => {
