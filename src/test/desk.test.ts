@@ -217,6 +217,45 @@ describe('the desk round trip', () => {
     assert.equal(calls, 1);
   });
 
+  it('never runs two passes at once, even from the microtask after a pass', async () => {
+    // The window OJ found: `#pass()` nulls `#running` in a `.finally` one
+    // microtask before its promise resolves, so a continuation awaiting that
+    // promise — `runReview` doing `await desk.drain()` and falling into
+    // `desk.stop()` — arrived while a queued pass was still scheduled and
+    // unschedulable. Keyed on `#running` alone, both then ran.
+    const dir = workspace();
+    let inside = 0;
+    let most = 0;
+    let served = 0;
+    const gateway = fixture({
+      async postComment(body) {
+        inside += 1;
+        most = Math.max(most, inside);
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        inside -= 1;
+        served += 1;
+        return `https://github.test/pr/1#issuecomment-${body.length}`;
+      },
+    });
+    const desk = deskFor(dir, gateway);
+
+    submit(dir, { action: 'comment', body: 'one' });
+    const first = desk.drain();
+    // Registered on the first pass BEFORE the queued continuation exists, so it
+    // runs first — this is the ordering that made two passes overlap.
+    const sneak = first.then(() => desk.drain());
+    const queued = desk.drain();
+    // Written while the first pass is inside GitHub, so both later passes have
+    // something to find.
+    submit(dir, { action: 'comment', body: 'two' });
+    submit(dir, { action: 'comment', body: 'three' });
+
+    await Promise.all([first, sneak, queued, desk.stop()]);
+
+    assert.equal(most, 1, 'two passes were inside the desk at once');
+    assert.equal(served, 3, 'every request written during the pass was served');
+  });
+
   it('discards a request whose name it would not have written', async () => {
     const dir = workspace();
     const gateway = fixture();

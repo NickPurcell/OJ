@@ -56,6 +56,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -586,8 +587,10 @@ function buildFollowUp(
     '',
     'The pull request has been flagged ready for review again. The working tree has been',
     `reset and re-checked-out at ${pull.headSha}${previousSha ? `, up from ${previousSha}` : ''}.`,
-    'Anything you wrote to disk during the previous round is gone; the conversation above',
-    'is intact, and so is everything you concluded in it.',
+    'Anything you wrote inside the checkout is gone. If you left a review file in your working',
+    'directory, it has been moved into `oj/` and OJO will not read it — it reviews a commit that',
+    'is no longer here, so write a fresh one. The conversation above is intact, and so is',
+    'everything you concluded in it.',
     '',
     previousSha
       ? `What changed since you last looked:\n\n    git -C ${clone.repoDir} diff ${previousSha}..${pull.headSha}\n`
@@ -842,16 +845,22 @@ function workerPermissionSettings(): string {
  * the one shape that explains a long silence from outside the session, and it
  * was unobtainable before.
  *
- * On arguments and privacy, stated exactly, because an operator will read this
- * to decide whether `journalctl` output is safe to paste somewhere. NO TOOL
- * INPUT FIELD THAT CARRIES FILE CONTENTS IS LOGGED: the fields are named
- * individually below, and `content`, `new_string` and `prompt` are deliberately
- * not among them, so a Write is its path and never its text. THE OUTPUT OF A
- * FAILED CALL IS LOGGED, up to `TOOL_RESULT_CHARS`, and that is not
- * content-free: `git diff --exit-code` fails and prints the diff, a failing test
- * prints the source lines it asserted on. That is the point of the change — a
- * denial and a wedge are both diagnosed from what came back — but it is a
- * trade, and on a private repository it is the operator's to know about.
+ * On arguments and privacy, stated as a trade rather than as a guarantee,
+ * because an operator will read this to decide whether `journalctl` output is
+ * safe to paste somewhere.
+ *
+ * The fields are named individually below, and the bulk carriers of file
+ * content — `content`, `new_string`, `prompt` — are deliberately not among
+ * them, so a Write is its path and never its text. That is the whole of the
+ * protection, and it is not an absolute: `command` IS logged, and a shell
+ * command can contain anything the worker chose to put in it, `printf '<the
+ * review>' | oj comment` included. The output of a FAILED call is logged too,
+ * up to `TOOL_RESULT_CHARS`, and `git diff --exit-code` fails and prints a diff.
+ *
+ * Both of those are the point rather than an oversight — a denial and a wedge
+ * are diagnosed from the command and from what came back — but the honest
+ * summary is that this journal can contain fragments of the reviewed repository,
+ * chosen by the reviewer, and not that it cannot.
  */
 const LOGGED_TOOL_FIELDS = [
   'command',
@@ -1321,12 +1330,25 @@ function looksLikeMissingSession(outcome: SpawnOutcome): boolean {
  */
 const REVIEW_FILE_CANDIDATES = ['review.md', join('oj', 'review.md')] as const;
 
+/**
+ * Why a candidate that existed was not used, and — the load-bearing part — which
+ * KIND of "not used" it was.
+ *
+ * `stale` means the file is not this round's work. `unusable` means it is this
+ * round's work and the handover failed. Those two want opposite instructions:
+ * one must be written afresh and the other must merely be posted, and a prompt
+ * that tells a worker to "fix that and post it" about a stale file is asking for
+ * a confident review of code nobody looked at. Carrying the distinction in the
+ * data rather than by matching on the sentence is the whole reason this is a
+ * record and not a string.
+ */
+export type ReviewFileNote = { path: string; kind: 'stale' | 'unusable'; text: string };
+
 export type ReviewFileSearch = {
   found: { path: string; body: string } | null;
   /** Every path considered, so a failure can name them instead of shrugging. */
   checked: string[];
-  /** Why something that was there was not used. */
-  notes: string[];
+  notes: ReviewFileNote[];
 };
 
 /**
@@ -1341,6 +1363,15 @@ export type ReviewFileSearch = {
  * applies to its request files and for the same reason: this file's contents are
  * about to be posted publicly, and the worker chooses the name.
  */
+function note(
+  search: ReviewFileSearch,
+  path: string,
+  kind: ReviewFileNote['kind'],
+  text: string,
+): void {
+  search.notes.push({ path, kind, text: `${path} ${text}` });
+}
+
 export function findWrittenReview(workerDir: string, writtenSince: number): ReviewFileSearch {
   const search: ReviewFileSearch = { found: null, checked: [], notes: [] };
   for (const candidate of REVIEW_FILE_CANDIDATES) {
@@ -1354,18 +1385,21 @@ export function findWrittenReview(workerDir: string, writtenSince: number): Revi
       continue;
     }
     if (!stat.isFile()) {
-      search.notes.push(`${path} is not a regular file, so it was not read`);
+      note(search, path, 'unusable', 'is not a regular file, so it was not read');
       continue;
     }
     if (stat.mtimeMs < writtenSince) {
-      search.notes.push(
-        `${path} was last written ${new Date(stat.mtimeMs).toISOString()}, before this round ` +
-          'started — it belongs to an earlier round and was left alone',
+      note(
+        search,
+        path,
+        'stale',
+        `was last written ${new Date(stat.mtimeMs).toISOString()}, before this round started — ` +
+          'it belongs to an earlier round and was left alone',
       );
       continue;
     }
     if (stat.size > MAX_REQUEST_BYTES) {
-      search.notes.push(`${path} is ${stat.size} bytes, past the ${MAX_REQUEST_BYTES}-byte cap`);
+      note(search, path, 'unusable', `is ${stat.size} bytes, past the ${MAX_REQUEST_BYTES}-byte cap`);
       continue;
     }
 
@@ -1373,16 +1407,60 @@ export function findWrittenReview(workerDir: string, writtenSince: number): Revi
     try {
       body = readFileSync(path, 'utf8');
     } catch (error) {
-      search.notes.push(`${path} could not be read: ${String(error)}`);
+      note(search, path, 'unusable', `could not be read: ${String(error)}`);
       continue;
     }
     if (body.trim().length === 0) {
-      search.notes.push(`${path} is empty`);
+      note(search, path, 'unusable', 'is empty');
       continue;
     }
     if (!search.found) search.found = { path, body };
   }
   return search;
+}
+
+/**
+ * Move an earlier round's review out of the way before this one starts.
+ *
+ * The worker directory outlives a round on purpose, so round 1's `review.md` is
+ * still sitting there when round 2 begins, and every rule that keeps it from
+ * being mistaken for this round's work is a rule someone has to remember:
+ * `findWrittenReview` refuses it by mtime, `buildFinishPrompt` has to describe
+ * it without inviting anyone to post it, and `buildFollowUp` tells the worker
+ * its files are gone — which was simply untrue of this one.
+ *
+ * Renaming it is cheaper than defending it. Afterwards the candidate paths hold
+ * only this round's work, so the mtime guard and the prompt branch become
+ * backstops for a case that no longer arises rather than the only thing standing
+ * between a stale file and a public comment.
+ *
+ * Renamed and not deleted: a review OJO failed to post is evidence, the failure
+ * comment promises it is still there, and `<workerDir>/oj` is where this service
+ * already keeps the round's paper trail.
+ */
+export function archiveStaleReviews(workerDir: string, before: number): string[] {
+  const archived: string[] = [];
+  for (const candidate of REVIEW_FILE_CANDIDATES) {
+    const path = join(workerDir, candidate);
+    let stat;
+    try {
+      stat = lstatSync(path);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile() || stat.mtimeMs >= before) continue;
+    const stamp = new Date(stat.mtimeMs).toISOString().replace(/[:.]/g, '-');
+    const target = join(workerDir, 'oj', `review-superseded-${stamp}.md`);
+    try {
+      mkdirSync(join(workerDir, 'oj'), { recursive: true });
+      renameSync(path, target);
+      archived.push(`${path} → ${target}`);
+    } catch {
+      // Left where it is. `findWrittenReview` still refuses it by mtime, which
+      // is why that rule stays even though this makes it nearly unreachable.
+    }
+  }
+  return archived;
 }
 
 /**
@@ -1406,6 +1484,9 @@ function buildFinishPrompt(search: ReviewFileSearch): string {
     'once; this is the last turn of the round, and nothing after it will be read.',
     '',
   ];
+  const unusable = search.notes.filter((entry) => entry.kind === 'unusable');
+  const stale = search.notes.filter((entry) => entry.kind === 'stale');
+
   if (search.found) {
     lines.push(
       `You wrote ${search.found.path}. Post it, exactly as it stands:`,
@@ -1414,24 +1495,40 @@ function buildFinishPrompt(search: ReviewFileSearch): string {
       '',
       'then record the verdict with `oj verdict blocking` or `oj verdict clean`.',
     );
-  } else if (search.notes.length > 0) {
-    // A file was there and OJO would not read it. Saying which, and why, is the
-    // difference between fixing one line and re-deriving a whole review: the
-    // work is on disk and only the handover failed.
+  } else if (unusable.length > 0) {
+    // This round's own work, and only the handover failed. Naming the reason is
+    // the difference between fixing one line and re-deriving a whole review.
     lines.push(
-      'A review file is on disk but OJO will not use it:',
-      ...search.notes.map((note) => `  - ${note}`),
+      'You wrote a review file this round and OJO will not read it as it stands:',
+      ...unusable.map((entry) => `  - ${entry.text}`),
       '',
       'Fix that and post it, or post the text directly — `oj comment` takes the body on stdin',
       'or `--file PATH` — and then record the verdict.',
     );
   } else {
     lines.push(
-      `Nothing was written to ${search.checked.join(' or ')}, so what you found is only in this`,
-      'conversation. Post it now — `oj comment` takes the body on stdin or `--file PATH` — and',
-      'then record the verdict.',
+      `Nothing was written to ${search.checked.join(' or ')} this round, so what you found is only`,
+      'in this conversation. Post it now — `oj comment` takes the body on stdin or `--file PATH`',
+      '— and then record the verdict.',
     );
   }
+
+  // Said separately, and never as something to "fix and post". A file left by an
+  // EARLIER round is a review of code this round has not looked at, and the
+  // worker can post it through `oj comment` whether OJO would read it or not —
+  // the mtime guard stops OJO, not the model. So the only safe sentence about it
+  // is that it is not yours.
+  if (stale.length > 0) {
+    lines.push(
+      '',
+      'There is an older review file in your directory, left by a previous round:',
+      ...stale.map((entry) => `  - ${entry.path}`),
+      '',
+      'It reviews a commit that is no longer checked out. DO NOT POST IT and do not copy from',
+      'it. Write what you found this round.',
+    );
+  }
+
   lines.push(
     '',
     'If the review genuinely did not happen, say so in the comment: that is a result, and',
@@ -1473,13 +1570,32 @@ function combineOutcomes(round: SpawnOutcome, followUp: SpawnOutcome): SpawnOutc
  * The text below the note is the worker's, unedited: this is the same content
  * `oj comment --file` would have posted, and the worker could always have posted
  * anything it liked, so nothing here widens what a review can say.
+ *
+ * `asked` is not decoration. Since the recovery started firing on rounds that
+ * were killed or crashed, there are two quite different stories — one where the
+ * session was asked again and would not post, and one where there was nobody
+ * left to ask — and a note that told the pull request about a second ask that
+ * never happened would be this service publishing a false sentence about itself.
  */
-function recoveredCommentBody(review: { path: string; body: string }, footer: string): string {
+function recoveredCommentBody(
+  review: { path: string; body: string },
+  footer: string,
+  asked: boolean,
+): string {
+  const account = asked
+    ? [
+        '> OJO recovered this review from the worker directory. The session that wrote it ended',
+        '> without posting it, and did not post when asked a second time.',
+      ]
+    : [
+        '> OJO recovered this review from the worker directory. The session that wrote it did not',
+        '> survive to post it — a round that is killed or crashes gets no second turn — so nobody',
+        '> asked it to.',
+      ];
   return [
     '> [!NOTE]',
-    `> OJO recovered this review from \`${review.path}\`. The session that wrote it ended`,
-    '> without posting it, and did not post when asked a second time. The text below is the',
-    "> reviewer's own, unedited.",
+    ...account,
+    `> Read from \`${review.path}\`. The text below is the reviewer's own, unedited.`,
     '',
     clipBody(review.body.trim()),
     '',
@@ -1507,9 +1623,13 @@ function saidNothingDetail(
   if (followUp?.timedOut) {
     lines.push('OJO asked once more; that turn hit its own timeout and was killed.');
   } else if (followUp && followUp.code !== 0) {
+    // Not "failed to start". A follow-up that resumed, took its turn and exited
+    // 1 on an API error is a different afternoon's work from one that never ran,
+    // and `code === null` means a signal killed it rather than that it exited 0.
     lines.push(
-      `OJO asked once more; that turn exited ${followUp.code ?? followUp.signal} without ` +
-        `starting: ${followUp.stderr.trim().slice(0, 300)}`,
+      `OJO asked once more; that turn ended ${
+        followUp.code === null ? `on ${followUp.signal ?? 'a signal'}` : `with exit ${followUp.code}`
+      }, having posted nothing: ${followUp.stderr.trim().slice(0, 300) || '(nothing on stderr)'}`,
     );
   } else if (followUp) {
     lines.push('OJO asked once more, in the same session, and it still posted nothing.');
@@ -1541,7 +1661,7 @@ function reviewFileAccount(search: ReviewFileSearch | null, recoveryError: strin
   }
   return [
     `No review file was written this round. Checked: ${search.checked.join(', ')}.`,
-    ...search.notes,
+    ...search.notes.map((entry) => entry.text),
     'Findings, if there were any, are in the session transcript.',
   ];
 }
@@ -1574,6 +1694,13 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
     };
   }
 
+  // Before anything is written this round: an earlier round's review is moved
+  // aside, so every path below deals only with this round's work. See
+  // `archiveStaleReviews` for why renaming beats defending it in three places.
+  for (const moved of archiveStaleReviews(workerDir, startedAt)) {
+    request.onProgress?.(`archived an earlier round's review: ${moved}`);
+  }
+
   const firstRound = request.round <= 1;
   const prompt = firstRound
     ? buildKickoff(request, clone)
@@ -1604,7 +1731,7 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
   let followUp: SpawnOutcome | null = null;
   const lookForReview = (): ReviewFileSearch => {
     const result = findWrittenReview(workerDir, startedAt);
-    for (const note of result.notes) request.onProgress?.(`review file: ${note}`);
+    for (const entry of result.notes) request.onProgress?.(`review file: ${entry.text}`);
     return result;
   };
   try {
@@ -1692,7 +1819,9 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
   let recoveryError: string | null = null;
   if (ledger.comments.length === 0 && search?.found) {
     try {
-      const url = await request.gateway.postComment(recoveredCommentBody(search.found, footer));
+      const url = await request.gateway.postComment(
+        recoveredCommentBody(search.found, footer, followUp !== null),
+      );
       ledger.comments.push(url);
       recovered = search.found.path;
       request.onProgress?.(`recovered ${search.found.path} and posted it as ${url}`);

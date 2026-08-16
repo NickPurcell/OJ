@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -25,6 +26,7 @@ import type { OjConfig, RepoConfig } from '../config.js';
 import { deskPaths } from '../desk.js';
 import type { PullRequest } from '../github.js';
 import {
+  archiveStaleReviews,
   createStreamMonitor,
   findWrittenReview,
   installOjCli,
@@ -340,7 +342,7 @@ describe('findWrittenReview', () => {
     const search = findWrittenReview(workerDir, Date.now() - 60_000);
 
     assert.equal(search.found, null);
-    assert.ok(search.notes.some((note) => note.includes('belongs to an earlier round')));
+    assert.ok(search.notes.some((note) => note.kind === 'stale'));
   });
 
   it('never reads the checkout, which the pull request controls', () => {
@@ -361,7 +363,23 @@ describe('findWrittenReview', () => {
     const search = findWrittenReview(workerDir, Date.now() - 60_000);
 
     assert.equal(search.found, null);
-    assert.ok(search.notes.some((note) => note.includes('not a regular file')));
+    assert.ok(search.notes.some((note) => note.kind === 'unusable' && note.text.includes('not a regular file')));
+  });
+
+  it('separates a stale file from one this round could not use', () => {
+    // The two want opposite instructions: one must be written afresh, the other
+    // merely posted. A prompt that says "fix that and post it" about a stale
+    // file asks for a confident review of code nobody looked at.
+    const workerDir = workerDirWith({ 'review.md': 'round one', 'oj/review.md': '  ' });
+    const old = new Date(Date.now() - 86_400_000);
+    utimesSync(join(workerDir, 'review.md'), old, old);
+
+    const search = findWrittenReview(workerDir, Date.now() - 60_000);
+
+    assert.deepEqual(
+      search.notes.map((note) => note.kind),
+      ['stale', 'unusable'],
+    );
   });
 
   it('names every path it looked at, so a failure can say so', () => {
@@ -374,7 +392,46 @@ describe('findWrittenReview', () => {
       join(workerDir, 'review.md'),
       join(workerDir, 'oj', 'review.md'),
     ]);
-    assert.ok(search.notes.some((note) => note.includes('is empty')));
+    assert.ok(search.notes.some((note) => note.kind === 'unusable' && note.text.includes('is empty')));
+  });
+});
+
+describe('archiveStaleReviews', () => {
+  function workerDirWith(files: Record<string, string>): string {
+    const workerDir = mkdtempSync(join(tmpdir(), 'oj-archive-'));
+    temporaries.push(workerDir);
+    for (const [name, content] of Object.entries(files)) {
+      const path = join(workerDir, name);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, content);
+    }
+    return workerDir;
+  }
+
+  it('moves an earlier round’s review aside, and keeps it', () => {
+    const workerDir = workerDirWith({ 'review.md': 'round one' });
+    const old = new Date(Date.now() - 86_400_000);
+    utimesSync(join(workerDir, 'review.md'), old, old);
+
+    const moved = archiveStaleReviews(workerDir, Date.now() - 60_000);
+
+    assert.equal(moved.length, 1);
+    assert.ok(!existsSync(join(workerDir, 'review.md')));
+    // Renamed, not deleted: a review OJO failed to post is evidence, and the
+    // failure comment says it is still there.
+    const kept = readdirSync(join(workerDir, 'oj'));
+    assert.equal(kept.length, 1);
+    assert.match(kept[0] ?? '', /^review-superseded-/);
+    assert.equal(readFileSync(join(workerDir, 'oj', kept[0] as string), 'utf8'), 'round one');
+  });
+
+  it('leaves this round’s own review exactly where the worker put it', () => {
+    const workerDir = workerDirWith({ 'review.md': 'this round' });
+
+    const moved = archiveStaleReviews(workerDir, Date.now() - 60_000);
+
+    assert.deepEqual(moved, []);
+    assert.equal(readFileSync(join(workerDir, 'review.md'), 'utf8'), 'this round');
   });
 });
 

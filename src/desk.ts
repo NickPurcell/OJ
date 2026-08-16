@@ -349,10 +349,15 @@ export class Desk {
   /**
    * Read every pending request, act on it, write the answer back.
    *
-   * Serialised against itself: a GitHub call can take seconds (longer when the
-   * client is sitting out a rate limit), and two overlapping drains would post
-   * the same request twice — the file is unlinked before the call, but the
-   * second drain can list it before the first unlinks it.
+   * Serialised against itself, though NOT for the reason this comment gave until
+   * 2026-08-16. It said two overlapping passes would post the same request
+   * twice; they would not, and crediting the wrong mechanism is how the right
+   * one gets removed by someone tidying up. What prevents the double post is
+   * that `#drainOnce` reads and unlinks each request synchronously, before its
+   * first `await`, so a second pass cannot list a file the first still holds.
+   * Serialisation buys ordering — a comment and the verdict that follows it go
+   * to GitHub in the order the worker wrote them — and it keeps one slow,
+   * rate-limited call from being joined by five more.
    *
    * AWAITING THIS MEANS EVERYTHING ON DISK HAS BEEN SERVED. Until 2026-08-16 a
    * re-entrant call returned immediately, which made it mutual exclusion wearing
@@ -368,8 +373,15 @@ export class Desk {
    * stack up hundreds of listings behind one slow GitHub call.
    */
   drain(): Promise<void> {
-    if (this.#running === null) return this.#pass();
-    this.#queued ??= this.#running.then(
+    // Both fields, not just `#running`. `#pass()` nulls `#running` in a `.finally`
+    // one microtask before its promise resolves, so a continuation awaiting that
+    // promise — `runReview` doing `await desk.drain()` and falling straight into
+    // `desk.stop()` — arrives in a window where a queued pass is still scheduled
+    // and cannot be unscheduled. Keyed on `#running` alone, both then ran.
+    if (this.#running === null && this.#queued === null) return this.#pass();
+    // A pass is already scheduled and will list the directory after this call.
+    if (this.#queued !== null) return this.#queued;
+    this.#queued = (this.#running as Promise<void>).then(
       () => this.#pass(),
       () => this.#pass(),
     );
