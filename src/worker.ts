@@ -587,17 +587,23 @@ function buildFollowUp(
     '',
     'The pull request has been flagged ready for review again. The working tree has been',
     `reset and re-checked-out at ${pull.headSha}${previousSha ? `, up from ${previousSha}` : ''}.`,
-    // What was moved, and why, said only as far as it is true. `previousSha` is
-    // null when nobody can say the head changed — a re-label with no push gives
-    // this round the same commit — and the sentence four lines down admits
-    // exactly that. Claiming here that the old review is of "a commit that is no
-    // longer here" would contradict it in the same prompt.
+    // Says the file is old and says nothing about which commit it reviews,
+    // because nothing here knows that. The obvious candidate, `previousSha`, is
+    // `lastReviewedHeadSha`, which advances only on a SUCCESSFUL round — it
+    // means "the last sha we managed to review", not "the head has moved". Both
+    // readings come apart in practice, and the second case is the one this
+    // service creates on purpose: a round that fails leaves the sha where it
+    // was, the failure comment tells a human to re-label, and the next round
+    // then archives a review written against the very commit it has checked
+    // out. Calling that "a review of an earlier commit" would be false in the
+    // path the system steers people down. The only fact established here is the
+    // one that caused the move — the file is not this round's work — so that is
+    // the only thing said.
     'Anything you wrote inside the checkout is gone. If you left `review.md` or `oj/review.md`',
-    `in your working directory, it has been moved into \`oj/\` and OJO will not read it: it is ${
-      previousSha ? 'a review of an earlier commit' : "the previous round's work, not this one's"
-    },`,
-    'so write a fresh one. Anything you left under another name is untouched, and OJO will not',
-    'read that either. The conversation above is intact, and so is everything you concluded in it.',
+    'in your working directory, it has been moved into `oj/` and OJO will not read it: it was',
+    'written by an earlier round, not this one, so write a fresh one. Anything you left under',
+    'another name is untouched, and OJO will not read that either. The conversation above is',
+    'intact, and so is everything you concluded in it.',
     '',
     previousSha
       ? `What changed since you last looked:\n\n    git -C ${clone.repoDir} diff ${previousSha}..${pull.headSha}\n`
@@ -1434,25 +1440,6 @@ export function findWrittenReview(workerDir: string, writtenSince: number): Revi
 }
 
 /**
- * Move an earlier round's review out of the way before this one starts.
- *
- * The worker directory outlives a round on purpose, so round 1's `review.md` is
- * still sitting there when round 2 begins, and every rule that keeps it from
- * being mistaken for this round's work is a rule someone has to remember:
- * `findWrittenReview` refuses it by mtime, `buildFinishPrompt` has to describe
- * it without inviting anyone to post it, and `buildFollowUp` tells the worker
- * its files are gone — which was simply untrue of this one.
- *
- * Renaming it is cheaper than defending it. Afterwards the candidate paths hold
- * only this round's work, so the mtime guard and the prompt branch become
- * backstops for a case that no longer arises rather than the only thing standing
- * between a stale file and a public comment.
- *
- * Renamed and not deleted: a review OJO failed to post is evidence, the failure
- * comment promises it is still there, and `<workerDir>/oj` is where this service
- * already keeps the round's paper trail.
- */
-/**
  * Where a stale review goes, as a function rather than a string built twice.
  *
  * The candidate's own name is in it, not only the timestamp: both candidates can
@@ -1470,6 +1457,28 @@ export function archivedReviewPath(workerDir: string, candidate: string, mtimeMs
   return join(workerDir, 'oj', `review-superseded-${stamp}-${from}`);
 }
 
+/**
+ * Move an earlier round's review out of the way before this one starts.
+ *
+ * The worker directory outlives a round on purpose, so round 1's `review.md` is
+ * still sitting there when round 2 begins, and every rule that keeps it from
+ * being mistaken for this round's work is a rule someone has to remember:
+ * `findWrittenReview` refuses it by mtime, `buildFinishPrompt` has to describe
+ * it without inviting anyone to post it, and `buildFollowUp` tells the worker
+ * its files are gone — which was simply untrue of this one.
+ *
+ * Renaming it is cheaper than defending it. Afterwards the candidate paths hold
+ * only this round's work, so the mtime guard and the prompt branch become
+ * backstops for a case that no longer arises rather than the only thing standing
+ * between a stale file and a public comment.
+ *
+ * Renamed and not deleted: a review OJO failed to post is evidence, the failure
+ * comment sends a human to `archivedReviewPath`'s answer to come and read it,
+ * and `<workerDir>/oj` is where this service already keeps the round's paper
+ * trail. That comment used to promise the file was still at `review.md`, which
+ * this function made false; the two now share one function so they cannot say
+ * different things.
+ */
 export function archiveStaleReviews(workerDir: string, before: number): string[] {
   const archived: string[] = [];
   for (const candidate of REVIEW_FILE_CANDIDATES) {
@@ -1555,7 +1564,7 @@ function buildFinishPrompt(search: ReviewFileSearch): string {
       'There is an older review file in your directory, left by a previous round:',
       ...stale.map((entry) => `  - ${entry.path}`),
       '',
-      'It reviews a commit that is no longer checked out. DO NOT POST IT and do not copy from',
+      'It was written by an earlier round, not this one. DO NOT POST IT and do not copy from',
       'it. Write what you found this round.',
     );
   }
@@ -1698,7 +1707,8 @@ function reviewFileAccount(
       ? [
           `Its review was on disk at ${search.found.path} and OJO could not post it either: ${recoveryError}`,
           `The file is kept. Re-adding the label starts a round that moves it to ${archive} ` +
-            'before it does anything else, so look for it under that name afterwards.',
+            'once it has cloned, so look for it under that name afterwards — and at the path ' +
+            'above if that round could not clone.',
         ]
       : [`Its review is on disk at ${search.found.path}.`];
   }
