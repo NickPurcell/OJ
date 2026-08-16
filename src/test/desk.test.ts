@@ -158,6 +158,104 @@ describe('the desk round trip', () => {
     assert.equal(gateway.comments.length, 1);
   });
 
+  it('awaiting a drain means everything on disk has been served', async () => {
+    // Until 2026-08-16 a re-entrant drain returned immediately, so `stop()` —
+    // which is a `drain()` — could return having drained nothing while a slow
+    // POST was in flight. `worker.ts` then read an empty ledger and concluded
+    // the round had said nothing, with the comment about to land.
+    const dir = workspace();
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const gateway = fixture({
+      async postComment(body) {
+        await held;
+        return `https://github.test/pr/1#issuecomment-${body.length}`;
+      },
+    });
+    const desk = deskFor(dir, gateway);
+
+    submit(dir, { action: 'comment', body: 'first' });
+    const slow = desk.drain();
+    // Arrives while the first pass is stuck inside GitHub, and writes a request
+    // that pass had already looked past.
+    submit(dir, { action: 'verdict', verdict: 'clean' });
+    const barrier = desk.stop();
+    release();
+    await Promise.all([slow, barrier]);
+
+    assert.equal(desk.ledger.comments.length, 1);
+    assert.equal(desk.ledger.verdict, 'clean');
+  });
+
+  it('does not stack a pass per timer tick behind one slow call', async () => {
+    const dir = workspace();
+    let calls = 0;
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const gateway = fixture({
+      async postComment(body) {
+        calls += 1;
+        await held;
+        return `https://github.test/pr/1#issuecomment-${body.length}`;
+      },
+    });
+    const desk = deskFor(dir, gateway);
+
+    submit(dir, { action: 'comment', body: 'first' });
+    const first = desk.drain();
+    // Ten callers arriving mid-pass share one queued pass between them: the
+    // half-second timer must not be able to queue a listing per tick.
+    const waiting = Array.from({ length: 10 }, () => desk.drain());
+    assert.equal(new Set(waiting).size, 1);
+    release();
+    await Promise.all([first, ...waiting]);
+
+    assert.equal(calls, 1);
+  });
+
+  it('never runs two passes at once, even from the microtask after a pass', async () => {
+    // The window OJ found: `#pass()` nulls `#running` in a `.finally` one
+    // microtask before its promise resolves, so a continuation awaiting that
+    // promise — `runReview` doing `await desk.drain()` and falling into
+    // `desk.stop()` — arrived while a queued pass was still scheduled and
+    // unschedulable. Keyed on `#running` alone, both then ran.
+    const dir = workspace();
+    let inside = 0;
+    let most = 0;
+    let served = 0;
+    const gateway = fixture({
+      async postComment(body) {
+        inside += 1;
+        most = Math.max(most, inside);
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        inside -= 1;
+        served += 1;
+        return `https://github.test/pr/1#issuecomment-${body.length}`;
+      },
+    });
+    const desk = deskFor(dir, gateway);
+
+    submit(dir, { action: 'comment', body: 'one' });
+    const first = desk.drain();
+    // Registered on the first pass BEFORE the queued continuation exists, so it
+    // runs first — this is the ordering that made two passes overlap.
+    const sneak = first.then(() => desk.drain());
+    const queued = desk.drain();
+    // Written while the first pass is inside GitHub, so both later passes have
+    // something to find.
+    submit(dir, { action: 'comment', body: 'two' });
+    submit(dir, { action: 'comment', body: 'three' });
+
+    await Promise.all([first, sneak, queued, desk.stop()]);
+
+    assert.equal(most, 1, 'two passes were inside the desk at once');
+    assert.equal(served, 3, 'every request written during the pass was served');
+  });
+
   it('discards a request whose name it would not have written', async () => {
     const dir = workspace();
     const gateway = fixture();

@@ -254,7 +254,8 @@ export function parseDeskRequest(body: string): ParsedRequest {
   };
 }
 
-function clipBody(body: string): string {
+/** Exported because `worker.ts` posts a recovered review without going through a request. */
+export function clipBody(body: string): string {
   if (body.length <= MAX_BODY_CHARS) return body;
   return `${body.slice(0, MAX_BODY_CHARS)}\n\n<sub>…truncated by OJO at ${MAX_BODY_CHARS} characters.</sub>`;
 }
@@ -304,7 +305,8 @@ export class Desk {
   readonly #options: DeskOptions;
   readonly #ledger: DeskLedger = { comments: [], issues: [], verdict: null, refusals: [] };
   #timer: NodeJS.Timeout | null = null;
-  #draining = false;
+  #running: Promise<void> | null = null;
+  #queued: Promise<void> | null = null;
 
   constructor(options: DeskOptions) {
     this.#options = options;
@@ -347,49 +349,86 @@ export class Desk {
   /**
    * Read every pending request, act on it, write the answer back.
    *
-   * Serialised against itself: a GitHub call can take seconds (longer when the
-   * client is sitting out a rate limit), and two overlapping drains would post
-   * the same request twice — the file is unlinked before the call, but the
-   * second drain can list it before the first unlinks it.
+   * Serialised against itself, though NOT for the reason this comment gave until
+   * 2026-08-16. It said two overlapping passes would post the same request
+   * twice; they would not, and crediting the wrong mechanism is how the right
+   * one gets removed by someone tidying up. What prevents the double post is
+   * that `#drainOnce` reads and unlinks each request synchronously, before its
+   * first `await`, so a second pass cannot list a file the first still holds.
+   * Serialisation buys ordering — a comment and the verdict that follows it go
+   * to GitHub in the order the worker wrote them — and it keeps one slow,
+   * rate-limited call from being joined by five more.
+   *
+   * AWAITING THIS MEANS EVERYTHING ON DISK HAS BEEN SERVED. Until 2026-08-16 a
+   * re-entrant call returned immediately, which made it mutual exclusion wearing
+   * a barrier's clothes: `stop()` awaits `drain()`, so a pass already in flight
+   * — a comment held up by a rate-limited POST, say — meant `stop()` cleared the
+   * timer and returned having drained nothing, and the caller then read a ledger
+   * that was missing a comment it went on to conclude had never been posted.
+   * Short-circuiting was wrong even for a pass in flight, because that pass may
+   * have listed the directory before the caller's request file existed.
+   *
+   * So a caller that arrives mid-pass waits for a fresh pass afterwards, and at
+   * most one such pass is ever queued: the half-second timer must not be able to
+   * stack up hundreds of listings behind one slow GitHub call.
    */
-  async drain(): Promise<void> {
-    if (this.#draining) return;
-    this.#draining = true;
-    try {
-      const paths = deskPaths(this.#options.workerDir);
-      const problem = realDirectoryProblem(paths.requests);
-      if (problem) {
-        if (problem !== 'does not exist') {
-          this.#options.onLog(`desk request directory: ${problem}; not drained`);
-        }
-        return;
-      }
-      // Sorted so requests are served in the order `oj` created them: the names
-      // start with a millisecond timestamp, and an agent that posts a comment
-      // and then a verdict means them in that order.
-      for (const name of safeReaddir(paths.requests).sort()) {
-        const path = join(paths.requests, name);
-        if (!REQUEST_NAME_PATTERN.test(name)) {
-          this.#options.onLog(`${name}: implausible desk request name, discarded unread`);
-          discard(path);
-          continue;
-        }
-        const body = readSmallFile(path, MAX_REQUEST_BYTES, this.#options.onLog);
-        // Unlinked before it is acted on. A request that throws must not be
-        // retried forever, least of all one that opens an issue.
-        discard(path);
-        if (body === null) continue;
+  drain(): Promise<void> {
+    // Both fields, not just `#running`. `#pass()` nulls `#running` in a `.finally`
+    // one microtask before its promise resolves, so a continuation awaiting that
+    // promise — `runReview` doing `await desk.drain()` and falling straight into
+    // `desk.stop()` — arrives in a window where a queued pass is still scheduled
+    // and cannot be unscheduled. Keyed on `#running` alone, both then ran.
+    if (this.#running === null && this.#queued === null) return this.#pass();
+    // A pass is already scheduled and will list the directory after this call.
+    if (this.#queued !== null) return this.#queued;
+    this.#queued = (this.#running as Promise<void>).then(
+      () => this.#pass(),
+      () => this.#pass(),
+    );
+    return this.#queued;
+  }
 
-        const parsed = parseDeskRequest(body);
-        const result = parsed.ok
-          ? await this.#perform(parsed.request)
-          : { ok: false, action: 'unknown', detail: parsed.reason };
-        if (!result.ok) this.#ledger.refusals.push(`${result.action}: ${result.detail}`);
-        this.#options.onLog(`oj ${result.action}: ${result.ok ? '' : 'REFUSED — '}${result.detail}`);
-        writeResult(paths.results, name, result, this.#options.onLog);
+  #pass(): Promise<void> {
+    this.#queued = null;
+    const pass = this.#drainOnce().finally(() => {
+      if (this.#running === pass) this.#running = null;
+    });
+    this.#running = pass;
+    return pass;
+  }
+
+  async #drainOnce(): Promise<void> {
+    const paths = deskPaths(this.#options.workerDir);
+    const problem = realDirectoryProblem(paths.requests);
+    if (problem) {
+      if (problem !== 'does not exist') {
+        this.#options.onLog(`desk request directory: ${problem}; not drained`);
       }
-    } finally {
-      this.#draining = false;
+      return;
+    }
+    // Sorted so requests are served in the order `oj` created them: the names
+    // start with a millisecond timestamp, and an agent that posts a comment
+    // and then a verdict means them in that order.
+    for (const name of safeReaddir(paths.requests).sort()) {
+      const path = join(paths.requests, name);
+      if (!REQUEST_NAME_PATTERN.test(name)) {
+        this.#options.onLog(`${name}: implausible desk request name, discarded unread`);
+        discard(path);
+        continue;
+      }
+      const body = readSmallFile(path, MAX_REQUEST_BYTES, this.#options.onLog);
+      // Unlinked before it is acted on. A request that throws must not be
+      // retried forever, least of all one that opens an issue.
+      discard(path);
+      if (body === null) continue;
+
+      const parsed = parseDeskRequest(body);
+      const result = parsed.ok
+        ? await this.#perform(parsed.request)
+        : { ok: false, action: 'unknown', detail: parsed.reason };
+      if (!result.ok) this.#ledger.refusals.push(`${result.action}: ${result.detail}`);
+      this.#options.onLog(`oj ${result.action}: ${result.ok ? '' : 'REFUSED — '}${result.detail}`);
+      writeResult(paths.results, name, result, this.#options.onLog);
     }
   }
 
