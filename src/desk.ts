@@ -254,7 +254,8 @@ export function parseDeskRequest(body: string): ParsedRequest {
   };
 }
 
-function clipBody(body: string): string {
+/** Exported because `worker.ts` posts a recovered review without going through a request. */
+export function clipBody(body: string): string {
   if (body.length <= MAX_BODY_CHARS) return body;
   return `${body.slice(0, MAX_BODY_CHARS)}\n\n<sub>…truncated by OJO at ${MAX_BODY_CHARS} characters.</sub>`;
 }

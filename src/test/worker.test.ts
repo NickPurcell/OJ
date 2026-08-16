@@ -8,7 +8,16 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -16,6 +25,8 @@ import type { OjConfig, RepoConfig } from '../config.js';
 import { deskPaths } from '../desk.js';
 import type { PullRequest } from '../github.js';
 import {
+  createStreamMonitor,
+  findWrittenReview,
   installOjCli,
   kickoffValues,
   render,
@@ -160,6 +171,198 @@ describe('the shipped OJ.md', () => {
     assert.doesNotMatch(rendered, /\{\{[a-zA-Z]/, 'no placeholder may survive rendering');
     assert.match(rendered, /oj comment/, 'the worker must be told how to post its review');
     assert.doesNotMatch(rendered, /report\.json/, 'the report file is retired');
+  });
+});
+
+describe('createStreamMonitor', () => {
+  // The message shapes below were taken from a real `claude --output-format
+  // stream-json --verbose` run rather than from documentation, including the
+  // second `result` with an `origin` — which is what a subagent's completion
+  // looks like, and what used to be reported as the round's total.
+  function monitorOver(lines: unknown[]): { logged: string[]; totals: ReturnType<typeof createStreamMonitor>['totals'] } {
+    const logged: string[] = [];
+    const monitor = createStreamMonitor((line) => logged.push(line));
+    for (const line of lines) monitor.handleLine(JSON.stringify(line));
+    monitor.finish();
+    return { logged, totals: monitor.totals };
+  }
+
+  const toolUse = (id: string, name: string, input: unknown): unknown => ({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id, name, input }] },
+  });
+  const toolResult = (id: string, isError: boolean, content: unknown): unknown => ({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content }] },
+  });
+
+  it('logs what a Bash call ran, and that it came back', () => {
+    const { logged } = monitorOver([
+      toolUse('t1', 'Bash', { command: 'git -C /w/repo diff a..b', description: 'the diff' }),
+      toolResult('t1', false, 'diff --git'),
+    ]);
+
+    assert.match(logged[0] ?? '', /tool 1 Bash started — git -C \/w\/repo diff a\.\.b/);
+    assert.match(logged[1] ?? '', /tool 1 Bash ok in \d/);
+  });
+
+  it('shows a refused call as a failure, which used to be invisible', () => {
+    // The exact case: a denied tool call arrives as a tool_result with
+    // is_error, and the old log printed `tool Bash` for it and nothing more.
+    const { logged } = monitorOver([
+      toolUse('t1', 'Bash', { command: 'git push origin HEAD' }),
+      toolResult('t1', true, [{ type: 'text', text: 'This command requires approval' }]),
+    ]);
+
+    assert.match(logged[1] ?? '', /tool 1 Bash FAILED in .* — This command requires approval/);
+  });
+
+  it('names the call a round went silent inside', () => {
+    const { logged } = monitorOver([
+      toolUse('t1', 'Bash', { command: 'ugrep -a -o -E .{0,60}' }),
+      toolUse('t2', 'Write', { file_path: '/w/review.md', content: 'secret contents' }),
+      toolResult('t2', false, 'ok'),
+    ]);
+
+    const summary = logged.find((line) => line.startsWith('session ended:'));
+    assert.match(summary ?? '', /2 tool call\(s\), 1 never returned/);
+    assert.ok(logged.some((line) => /never returned: tool 1 Bash — ugrep/.test(line)));
+    // A Write is logged as its path. Its text is the reviewed repository's
+    // content and has no business in the journal.
+    assert.ok(logged.some((line) => line.includes('/w/review.md')));
+    assert.ok(!logged.some((line) => line.includes('secret contents')));
+  });
+
+  it('does not let a result with no usage fields report the round as free', () => {
+    const { logged, totals } = monitorOver([
+      { type: 'result', subtype: 'success', session_id: 'abcdef01-1111' },
+      {
+        type: 'result',
+        subtype: 'success',
+        num_turns: 17,
+        total_cost_usd: 4.4044,
+        session_id: 'abcdef01-1111',
+        stop_reason: 'end_turn',
+        terminal_reason: 'completed',
+        duration_ms: 897_000,
+      },
+    ]);
+
+    assert.equal(totals.results, 2);
+    assert.equal(totals.turns, 17);
+    assert.equal(totals.costUsd, 4.4044);
+    // The unexplained one is printed whole rather than as zeros.
+    assert.match(logged[0] ?? '', /carries no num_turns\/total_cost_usd/);
+    assert.match(logged[1] ?? '', /result #2 success turns=17 \$4\.4044 session=abcdef01/);
+    assert.match(logged[1] ?? '', /stop=end_turn\/completed/);
+  });
+
+  it('reports the round, not the subagent turn that finished after it', () => {
+    const { totals } = monitorOver([
+      { type: 'result', subtype: 'success', num_turns: 17, total_cost_usd: 4.4044 },
+      {
+        type: 'result',
+        subtype: 'success',
+        num_turns: 1,
+        total_cost_usd: 0.0374,
+        origin: { kind: 'task-notification' },
+      },
+    ]);
+
+    assert.equal(totals.turns, 17);
+    assert.equal(totals.costUsd, 4.4044);
+  });
+
+  it('says when the session was denied something, or made to wait', () => {
+    const { logged } = monitorOver([
+      { type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } },
+      { type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } },
+      { type: 'system', subtype: 'thinking_tokens' },
+      { type: 'system', subtype: 'compact_boundary' },
+      {
+        type: 'result',
+        subtype: 'success',
+        num_turns: 2,
+        total_cost_usd: 1,
+        permission_denials: [{ tool_name: 'Bash' }],
+      },
+    ]);
+
+    assert.ok(logged.some((line) => line === 'rate limit: rejected'));
+    // `allowed` is the steady state and would be one line per session for nothing.
+    assert.ok(!logged.some((line) => line.includes('allowed')));
+    assert.ok(!logged.some((line) => line.includes('thinking_tokens')));
+    assert.ok(logged.some((line) => line === 'session compact_boundary'));
+    assert.ok(logged.some((line) => line.includes('1 permission denial(s): Bash')));
+  });
+});
+
+describe('findWrittenReview', () => {
+  function workerDirWith(files: Record<string, string>): string {
+    const workerDir = mkdtempSync(join(tmpdir(), 'oj-review-'));
+    temporaries.push(workerDir);
+    for (const [name, content] of Object.entries(files)) {
+      const path = join(workerDir, name);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, content);
+    }
+    return workerDir;
+  }
+
+  it('finds the review the worker was told to write', () => {
+    const workerDir = workerDirWith({ 'review.md': '## Findings\n\nsomething' });
+
+    const search = findWrittenReview(workerDir, Date.now() - 60_000);
+
+    assert.equal(search.found?.path, join(workerDir, 'review.md'));
+    assert.match(search.found?.body ?? '', /## Findings/);
+  });
+
+  it('leaves an earlier round’s review alone', () => {
+    // The worker directory outlives a round, so round 2 finds round 1's file
+    // sitting there. Posting it would be a confident review of code nobody read.
+    const workerDir = workerDirWith({ 'review.md': 'round one' });
+    const old = new Date(Date.now() - 86_400_000);
+    utimesSync(join(workerDir, 'review.md'), old, old);
+
+    const search = findWrittenReview(workerDir, Date.now() - 60_000);
+
+    assert.equal(search.found, null);
+    assert.ok(search.notes.some((note) => note.includes('belongs to an earlier round')));
+  });
+
+  it('never reads the checkout, which the pull request controls', () => {
+    const workerDir = workerDirWith({
+      'repo/review.md': 'a review written by the pull request itself',
+    });
+
+    const search = findWrittenReview(workerDir, Date.now() - 60_000);
+
+    assert.equal(search.found, null);
+    for (const path of search.checked) assert.ok(!path.includes(`${'repo'}/`));
+  });
+
+  it('refuses a symlink rather than following it', () => {
+    const workerDir = workerDirWith({ 'elsewhere.md': 'not mine to post' });
+    symlinkSync(join(workerDir, 'elsewhere.md'), join(workerDir, 'review.md'));
+
+    const search = findWrittenReview(workerDir, Date.now() - 60_000);
+
+    assert.equal(search.found, null);
+    assert.ok(search.notes.some((note) => note.includes('not a regular file')));
+  });
+
+  it('names every path it looked at, so a failure can say so', () => {
+    const workerDir = workerDirWith({ 'review.md': '   \n' });
+
+    const search = findWrittenReview(workerDir, Date.now() - 60_000);
+
+    assert.equal(search.found, null);
+    assert.deepEqual(search.checked, [
+      join(workerDir, 'review.md'),
+      join(workerDir, 'oj', 'review.md'),
+    ]);
+    assert.ok(search.notes.some((note) => note.includes('is empty')));
   });
 });
 

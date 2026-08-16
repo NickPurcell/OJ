@@ -63,10 +63,12 @@ a target is refused rather than obeyed.
 harder to undo later than to fix now. Everything else worth saying is
 **non-blocking**. In doubt, non-blocking: blocking is you asking a human to stop.
 
-Run the workflow tool, finding both kinds. When it is complete post **one
-comment** — what you found, and what you could not check — then record the
-verdict. As you go, `oj issue` anything real that is outside this pull request's
-scope, rather than saving it for the comment.
+Run the workflow tool, finding both kinds. Write the review to `review.md` in
+your working directory as you go, then post it with `oj comment --file
+review.md` and record the verdict. Both steps are yours: OJO reads `review.md`
+only if your session ends without posting, and a review it has to recover posts
+with a note saying you did not send it. As you go, `oj issue` anything real that
+is outside this pull request's scope, rather than saving it for the comment.
 
 If this is not approved the pull request will be flagged for review again later,
 and you will be woken with a short message instead of this one. That round checks
