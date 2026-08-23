@@ -25,7 +25,7 @@ pollIntervalSeconds: 60
 # Stay on `comment` until you trust it. A bot that can REQUEST_CHANGES can
 # block a release over a hallucination, and a bot that can APPROVE can be the
 # reason nobody looked. Switching later is one word and a restart.
-verdictMode: comment
+verdictMode: full
 
 # Reviews running at once, across every repo. Each one is a Claude Code process
 # with subagents beneath it — this is a memory limit, not an API limit.
