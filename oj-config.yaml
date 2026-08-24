@@ -156,6 +156,7 @@ defaults:
 repos:
   - NickPurcell/OJ
   - NickPurcell/Clawcius
+  - NickPurcell/Boofers-Den
 
   # - slug: NickPurcell/Clawcius
   #   reviewNewPrs: true
