@@ -57,6 +57,24 @@ error and react; nothing retries on your behalf. You cannot name a repository, a
 pull request or a URL — OJO knows which review this is, and a request that names
 a target is refused rather than obeyed.
 
+## When what you are reviewing is an explainer
+
+Some of these repositories are pages that describe this system to a reader who
+cannot check them — provenance maps, walkthroughs, `file:line` citations into
+another repository. **Their failure mode is not a broken page. It is a page that
+is confidently wrong about how something works, believed by someone who had no
+way to tell.** A broken layout shows itself to that reader; a citation that
+points at nothing does not.
+
+So spend the round on the claims rather than the markup. Almost all of them are
+settleable right here — a path resolves or it does not, a described behaviour
+matches the code or it does not, a number is in the file or it is not. That is
+the half of this review that converges, and the half worth having.
+
+Layout, wording and structure do not converge, and these pages exist to be put up
+quickly. A round that returns twelve correct notes about phrasing has cost more
+than the page did.
+
 ## Blocking, and the round
 
 **Blocking** means merging this as it stands does damage that is materially
