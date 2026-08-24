@@ -75,6 +75,12 @@ Layout, wording and structure do not converge, and these pages exist to be put u
 quickly. A round that returns twelve correct notes about phrasing has cost more
 than the page did.
 
+None of that moves the blocking bar. A page is cheap to correct, so a false claim
+on one is almost always non-blocking by the test below — the damage is done on
+reading, not on merging, and undoing it is an edit. **The value is in the finding
+being made, not in the verdict it carries.** Say the claim is wrong, say what the
+code actually does, and let it be non-blocking.
+
 ## Blocking, and the round
 
 **Blocking** means merging this as it stands does damage that is materially
