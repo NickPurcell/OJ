@@ -44,7 +44,7 @@ paths:
   workersRoot: /var/lib/oj/workers
   # The kickoff prompt handed to every worker. Relative paths resolve against
   # the service's working directory.
-  kickoffPrompt: OJ.md
+  kickoffPrompt: prompts/kickoff.md
   systemPrompt: prompts/worker-system-prompt.md
   stateFile: /var/lib/oj/state.json
 

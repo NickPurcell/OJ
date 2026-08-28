@@ -138,7 +138,7 @@ describe('installOjCli', () => {
   });
 });
 
-describe('the shipped OJ.md', () => {
+describe('the shipped kickoff', () => {
   it('renders against exactly the values a round supplies', () => {
     // `render` refuses an unknown placeholder rather than passing `{{...}}`
     // through to the model as literal text. Catching that here is the
@@ -160,7 +160,8 @@ describe('the shipped OJ.md', () => {
         headRepoSlug: 'NickPurcell/OJ',
       } as PullRequest,
       round: 1,
-    } as ReviewRequest;
+      config: { worker: { timeoutMinutes: 45 } },
+    } as unknown as ReviewRequest;
     const clone: CloneResult = {
       repoDir: '/var/lib/oj/workers/x/repo',
       mergeBase: '0123456789',
@@ -171,7 +172,7 @@ describe('the shipped OJ.md', () => {
     // dist/test/worker.test.js → the repository root, so this does not depend
     // on which directory the tests were started from.
     const repoRoot = dirname(dirname(dirname(import.meta.filename)));
-    const rendered = render(readFileSync(join(repoRoot, 'OJ.md'), 'utf8'), kickoffValues(request, clone));
+    const rendered = render(readFileSync(join(repoRoot, 'prompts', 'kickoff.md'), 'utf8'), kickoffValues(request, clone, '(measurements)'));
 
     assert.doesNotMatch(rendered, /\{\{[a-zA-Z]/, 'no placeholder may survive rendering');
     assert.match(rendered, /oj comment/, 'the worker must be told how to post its review');
