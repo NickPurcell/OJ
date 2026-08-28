@@ -323,6 +323,12 @@ describe('createStreamMonitor', () => {
 
     assert.equal(logged[0], 'rate limit: rejected, resets 2026-08-16T20:00:00.000Z');
   });
+  it('remembers when a rejected rate limit resets', () => {
+    const { totals } = monitorOver([
+      { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1700000000 } },
+    ]);
+    assert.equal(totals.rateLimitResetsAt, 1700000000);
+  });
 });
 
 describe('sessionIdFor', () => {

@@ -129,6 +129,15 @@ export function failureComment(reason: string, detail: string, label: string): s
 
 // ── What `oj pr` and `oj comments` print ─────────────────────────────────────
 
+export function rateLimitedComment(retryAfter: number | null): string {
+  const when = retryAfter ? new Date(retryAfter).toISOString() : 'shortly';
+  return [
+    '## OJ is rate-limited',
+    '',
+    `The review round hit the API rate limit before posting anything. OJO retries by itself after ${when}; no re-label is needed.`,
+  ].join('\n');
+}
+
 export type ChangedFile = {
   filename: string;
   status: string;
