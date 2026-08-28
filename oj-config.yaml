@@ -44,7 +44,6 @@ review:
     🧬 OJ is reviewing this pull request. I will post findings here when the
     sweep finishes — if nothing appears within the hour, something broke on my
     end.
-  workerTtlHours: 72
   maxCommentsPerRound: 10
   maxIssuesPerRound: 5
 

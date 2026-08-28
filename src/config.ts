@@ -65,7 +65,6 @@ export type OjConfig = {
 
   review: {
     acknowledgement: string;
-    workerTtlHours: number;
     maxCommentsPerRound: number;
     maxIssuesPerRound: number;
   };
@@ -122,7 +121,6 @@ const DEFAULTS = {
     acknowledgement:
       '🧬 OJ is reviewing this pull request. I will post findings here when the ' +
       'sweep finishes — if nothing appears within the hour, something broke on my end.',
-    workerTtlHours: 72,
     maxCommentsPerRound: 10,
     maxIssuesPerRound: 5,
   },
@@ -331,12 +329,6 @@ export function loadConfig(configPath?: string): OjConfig {
         review['acknowledgement'],
         'review.acknowledgement',
         DEFAULTS.review.acknowledgement,
-      ),
-      workerTtlHours: num(
-        review['workerTtlHours'],
-        'review.workerTtlHours',
-        DEFAULTS.review.workerTtlHours,
-        0,
       ),
       maxCommentsPerRound: num(
         review['maxCommentsPerRound'],

@@ -174,8 +174,7 @@ new*, and to say what got fixed.
 did not cause becomes an issue, as it goes, rather than a paragraph nobody acts
 on at the bottom of a review.
 
-**Cleans up.** Merged or closed → the directory goes. Plus a TTL sweep for pull
-requests that went quiet without closing.
+**Cleans up.** Merged or closed → the directory goes.
 
 **Fails loudly and specifically.** A round that posts nothing has its review
 recovered from disk and posted for it, whatever killed the session — losing

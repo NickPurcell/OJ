@@ -138,14 +138,12 @@ export type PullRequest = {
   htmlUrl: string;
   authorLogin: string;
   baseRef: string;
-  baseSha: string;
   headRef: string;
   headSha: string;
   /** True when the head branch lives in a different repository. */
   fromFork: boolean;
   headRepoSlug: string;
   labels: string[];
-  updatedAt: string;
 };
 
 type RawPull = {
@@ -179,7 +177,6 @@ function toPullRequest(raw: RawPull, slug: string): PullRequest {
     htmlUrl: raw.html_url ?? '',
     authorLogin: raw.user?.login ?? '',
     baseRef: raw.base?.ref ?? '',
-    baseSha: raw.base?.sha ?? '',
     headRef: raw.head?.ref ?? '',
     headSha: raw.head?.sha ?? '',
     // A deleted fork leaves head.repo null. Treating that as "not a fork"
@@ -187,7 +184,6 @@ function toPullRequest(raw: RawPull, slug: string): PullRequest {
     fromFork: headRepoSlug !== slug,
     headRepoSlug: headRepoSlug || '(deleted repository)',
     labels: (raw.labels ?? []).map((label) => label.name ?? '').filter(Boolean),
-    updatedAt: raw.updated_at ?? '',
   };
 }
 
@@ -387,11 +383,6 @@ export class GitHubClient {
       if (error instanceof GitHubError && error.status === 404) return;
       throw error;
     }
-  }
-
-  async addLabels(owner: string, repo: string, number: number, labels: string[]): Promise<void> {
-    if (labels.length === 0) return;
-    await this.#request('POST', `/repos/${owner}/${repo}/issues/${number}/labels`, { labels });
   }
 
   async createReview(

@@ -966,12 +966,6 @@ function spawnClaude(
   });
 }
 
-function looksLikeMissingSession(outcome: SpawnOutcome): boolean {
-  return /no (conversation|session)|session .* not found|could not find session/i.test(
-    outcome.stderr,
-  );
-}
-
 export async function runReview(request: ReviewRequest, previousSha: string | null): Promise<WorkerOutcome> {
   const startedAt = Date.now();
   const workerDir = workerDirFor(request.config, request.repo.slug, request.pull.number);
@@ -1017,12 +1011,6 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
   try {
     desk.start();
     outcome = await spawnClaude(request, workerDir, prompt, !firstRound, binDir);
-    if (!firstRound && outcome.code !== 0 && looksLikeMissingSession(outcome)) {
-      request.onProgress?.('resume found no transcript — starting a fresh session');
-      const fresh = buildKickoff(request, clone, measurements);
-      writeFileSync(join(workerDir, 'oj', `kickoff-round-${request.round}-restart.md`), fresh);
-      outcome = await spawnClaude(request, workerDir, fresh, false, binDir);
-    }
     await desk.drain();
   } finally {
     await desk.stop();
@@ -1079,7 +1067,7 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
   };
 }
 
-/** Remove a PR's directory. Called when the PR closes, and by the TTL sweep. */
+/** Remove a PR's directory when the PR closes. */
 export function removeWorkerDir(config: OjConfig, slug: string, prNumber: number): void {
   rmSync(workerDirFor(config, slug, prNumber), { recursive: true, force: true });
 }

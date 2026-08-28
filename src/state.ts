@@ -5,10 +5,6 @@ import { dirname } from 'node:path';
 export type PrRecord = {
   slug: string;
   number: number;
-  /** Absolute path to the per-PR directory. Deleted when the PR closes. */
-  workerDir: string;
-  /** Deterministic per PR — see `sessionIdFor` in worker.ts. Stored for the log. */
-  sessionId: string;
   rounds: number;
   lastReviewedHeadSha: string | null;
   retryAfter: number | null;
@@ -18,7 +14,6 @@ export type PrRecord = {
 
 export type RepoRecord = {
   baselinePr: number;
-  firstSeenAt: number;
 };
 
 type StateFile = {
@@ -75,13 +70,7 @@ export class StateStore {
     this.#write();
   }
 
-  /** Bump the activity clock without rewriting the rest of the record. */
-  touch(slug: string, number: number): void {
-    const record = this.get(slug, number);
-    if (!record) return;
-    record.lastActivityAt = Date.now();
-    this.#write();
-  }
+  
 
   remove(slug: string, number: number): void {
     delete this.#state.prs[prKey(slug, number)];
@@ -101,7 +90,7 @@ export class StateStore {
     const existing = this.#state.repos[slug];
     if (existing) return existing.baselinePr;
 
-    this.#state.repos[slug] = { baselinePr: highestOpenPr, firstSeenAt: Date.now() };
+    this.#state.repos[slug] = { baselinePr: highestOpenPr };
     this.#write();
     process.stdout.write(
       `[oj] ${slug}: first sight — baselining reviewNewPrs at #${highestOpenPr}. ` +

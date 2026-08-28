@@ -18,7 +18,7 @@ import {
   verdictBody,
 } from './review.js';
 import { prKey, StateStore } from './state.js';
-import { removeWorkerDir, runReview, sessionIdFor, workerDirFor } from './worker.js';
+import { removeWorkerDir, runReview, workerDirFor } from './worker.js';
 
 const config = loadConfig();
 const client = new GitHubClient(createAuth(loadAuthEnv(), config.github.apiBaseUrl), config.github.apiBaseUrl);
@@ -27,21 +27,6 @@ const state = new StateStore(config.paths.stateFile);
 mkdirSync(config.paths.workersRoot, { recursive: true, mode: 0o700 });
 
 let identity = '';
-
-function warnIfProxyIgnored(): void {
-  const proxy = process.env['HTTPS_PROXY'] ?? process.env['https_proxy'] ?? process.env['HTTP_PROXY'] ?? process.env['http_proxy'];
-  if (!proxy) return;
-  const enabled =
-    process.env['NODE_USE_ENV_PROXY'] === '1' ||
-    process.execArgv.includes('--use-env-proxy') ||
-    (process.env['NODE_OPTIONS'] ?? '').includes('--use-env-proxy');
-  if (enabled) return;
-  process.stderr.write(
-    `[oj] a proxy is configured (${proxy}) but this process is not using it — Node's fetch ` +
-      'ignores the proxy variables by default. Every GitHub request will fail with EAI_AGAIN. ' +
-      'Set NODE_USE_ENV_PROXY=1 in the environment (the systemd unit does).\n',
-  );
-}
 
 const log = (message: string): void => {
   process.stdout.write(`[oj] ${message}\n`);
@@ -179,8 +164,6 @@ async function review(queued: QueuedReview): Promise<void> {
   state.put({
     slug: repo.slug,
     number: pull.number,
-    workerDir: workerDirFor(config, repo.slug, pull.number),
-    sessionId: sessionIdFor(repo.slug, pull.number),
     rounds: round,
     lastReviewedHeadSha: outcome.ok ? pull.headSha : (existing?.lastReviewedHeadSha ?? null),
     retryAfter: !outcome.ok && outcome.reason === 'rate-limited' ? outcome.retryAfter : null,
@@ -280,21 +263,6 @@ async function retireClosed(repo: RepoConfig, openNumbers: Set<number>): Promise
   }
 }
 
-function sweepStale(): void {
-  if (config.review.workerTtlHours <= 0) return;
-  const cutoff = Date.now() - config.review.workerTtlHours * 3600_000;
-  for (const record of state.all()) {
-    if (record.lastActivityAt > cutoff) continue;
-    if (inFlight.has(prKey(record.slug, record.number))) continue;
-    removeWorkerDir(config, record.slug, record.number);
-    state.remove(record.slug, record.number);
-    log(
-      `${record.slug}#${record.number}: idle for over ${config.review.workerTtlHours}h — ` +
-        'worker directory reclaimed',
-    );
-  }
-}
-
 async function tick(): Promise<void> {
   const queue: QueuedReview[] = [];
 
@@ -345,7 +313,6 @@ async function tick(): Promise<void> {
     await retireClosed(repo, openNumbers);
   }
 
-  sweepStale();
 
   if (queue.length > 0) {
     log(`${queue.length} review(s) queued`);
@@ -354,7 +321,6 @@ async function tick(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  warnIfProxyIgnored();
 
   try {
     identity = await client.whoAmI();
