@@ -1,49 +1,3 @@
-/**
- * One OJ worker: a per-PR directory, a clone in it, and a headless Claude Code
- * session that lives as long as the pull request does.
- *
- * Four properties are load-bearing here. Read them before changing anything
- * in this file, because each one is easy to break in a way that still works.
- *
- * 1. THE WORKER HAS NO GITHUB CREDENTIAL. OJO fetches and OJO posts; the worker
- *    reads what was fetched and asks for what it wants posted. Its environment
- *    is built from an allowlist rather than filtered by a denylist, and the
- *    result is checked against the live token before spawn. A worker reads code
- *    written by whoever opened the PR, so treat "the worker is prompt-injected"
- *    as the normal case rather than the bad case. An injected worker with no
- *    credential can waste tokens and post noise onto the pull request it was
- *    already reviewing. An injected worker with a credential can push.
- *
- *    That property did not change when the worker gained the ability to comment
- *    on 2026-08-11. See `desk.ts`: `oj` writes a file, OJO makes the call, and
- *    the request has no field in which to name a different target.
- *
- * 2. INSTRUCTIONS COME FROM THE BASE BRANCH. `OJ.md` is read with
- *    `git show <base>:OJ.md`, never from the checked-out head. A pull request
- *    that edits OJ.md is a pull request writing its own review, and this is
- *    the single line of code that stops it.
- *
- * 3. THE CLONE IS SCRUBBED AND DISPOSABLE. Files that agentic tools treat as
- *    instructions are deleted from the working tree and marked `-diff` in
- *    `.git/info/attributes`, so they cannot steer the worker either by being
- *    read or by appearing in the diff it reviews.
- *
- * 4. THE ROUND'S OUTPUT IS WHAT THE WORKER POSTED, NOT A FILE IT LEFT BEHIND.
- *    Until 2026-08-11 a round succeeded only if `oj/report.json` existed and
- *    parsed; twice it did not, and twice a finished review was thrown away as
- *    `no-report`. The desk replaced that (see `desk.ts` for the full account).
- *    A round now fails only if the worker never said anything, and that failure
- *    is reported as what it is.
- *
- *    A round that tries to end without posting is refused once by a Stop hook
- *    (`installOjCli`), which tells the worker to post; a round that still posts
- *    nothing is reported as a failure.
- *
- * The directory outlives a round on purpose: Claude Code derives its
- * transcript location from the working directory, so a fresh directory per
- * round would mean `--resume` silently starting a new conversation and the
- * agent re-deriving everything it already knew about the PR.
- */
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -68,23 +22,8 @@ import {
 import type { PullRequest } from './github.js';
 import { commentFooter } from './review.js';
 
-/**
- * Namespace for the deterministic session ids. Any fixed UUID works; this one
- * is arbitrary and must never change, because changing it orphans every live
- * session on the host at once.
- */
 const OJ_UUID_NAMESPACE = '6f6a2d72-6576-4965-9765-72000000000a';
 
-/**
- * The session id for a pull request, derived rather than remembered.
- *
- * RFC 4122 v5: SHA-1 over a fixed namespace plus `owner/repo#number`. The same
- * PR always produces the same id, on any host, with no bookkeeping — so a
- * second round resumes the first round's conversation even if OJO restarted,
- * lost its state file, or was reinstalled in between. The alternative was
- * storing an id and reconciling it with the transcript on disk, which is two
- * sources of truth for a value that was always a pure function of the PR.
- */
 export function sessionIdFor(slug: string, prNumber: number): string {
   const namespace = Buffer.from(OJ_UUID_NAMESPACE.replace(/-/g, ''), 'hex');
   const hash = createHash('sha1')
@@ -106,8 +45,6 @@ export function sessionIdFor(slug: string, prNumber: number): string {
 }
 
 export function workerDirFor(config: OjConfig, slug: string, prNumber: number): string {
-  // Flat, and `/` replaced rather than nested: one `ls` of the workers root
-  // shows every live review, which is the question an operator actually has.
   return join(config.paths.workersRoot, `${slug.replace(/\//g, '__')}__${prNumber}`);
 }
 
@@ -124,7 +61,6 @@ export type WorkerOutcome =
       hadRepoInstructions: boolean;
       costUsd: number;
       turns: number;
-      /** Non-empty when the round produced a review despite a rough exit. */
       caveat: string;
     }
   | {
@@ -133,7 +69,6 @@ export type WorkerOutcome =
       detail: string;
       workerDir: string;
       durationMs: number;
-      /** Present even on failure: the worker may have opened issues before dying. */
       ledger: DeskLedger;
       /** When OJO should try again by itself, or null when a re-label is needed. */
       retryAfter: number | null;
@@ -146,10 +81,6 @@ export type ReviewRequest = {
   round: number;
   /** Short-lived; used for the fetch and then dropped. Never reaches the worker. */
   gitToken: string;
-  /**
-   * How the desk reaches GitHub. Built by `index.ts`, closed over this repo and
-   * this pull request — which is precisely why a request cannot name another.
-   */
   gateway: DeskGateway;
   onProgress?: (line: string) => void;
 };
@@ -158,17 +89,6 @@ export type ReviewRequest = {
 
 type GitResult = { code: number; stdout: string; stderr: string };
 
-/**
- * Proxy variables, which have to reach both git and the worker.
- *
- * On a host whose only route out is a proxy — which is the shape of every
- * carefully-egressed agent host — dropping these means `git fetch` cannot
- * resolve github.com and the worker cannot reach the Anthropic API. Both
- * failures present as "the review never happened" with no useful error, which
- * is why they are listed rather than left to the ambient environment: this
- * file builds environments from scratch, and anything not named here does not
- * exist as far as its children are concerned.
- */
 const PROXY_VARS = [
   'HTTP_PROXY',
   'HTTPS_PROXY',
@@ -178,16 +98,7 @@ const PROXY_VARS = [
   'no_proxy',
 ] as const;
 
-/**
- * Run git with the credential supplied out-of-band.
- *
- * The token goes in an environment variable read by a tiny askpass script, and
- * *not* into the remote URL. That difference is the whole reason this function
- * exists: `git clone https://token@host/...` writes the token into
- * `.git/config`, inside the directory a possibly-injected agent is about to be
- * pointed at. The URL here carries only the username `x-access-token`, which
- * is public knowledge, and the password never touches disk or a command line.
- */
+/** Run git with the credential supplied out-of-band. */
 function git(
   args: string[],
   options: { cwd?: string; token?: string; askpass?: string; timeoutMs?: number } = {},
@@ -196,8 +107,6 @@ function git(
     const env: NodeJS.ProcessEnv = {
       PATH: process.env['PATH'] ?? '/usr/bin:/bin',
       HOME: process.env['HOME'] ?? '/tmp',
-      // Never block on a credential prompt: a service with no terminal would
-      // hang forever rather than fail, and a hung fetch looks like a hung review.
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_NOSYSTEM: '1',
       LC_ALL: 'C',
@@ -214,15 +123,8 @@ function git(
     const child = spawn(
       'git',
       [
-        // Repository content must never get to run code during a fetch or a
-        // checkout. Hooks do not come from the repo's tree, but a reused
-        // directory's `.git/hooks` might have been written by an earlier
-        // round's agent, which had write access to everything under its cwd.
         '-c',
         'core.hooksPath=/dev/null',
-        // Ignore any credential helper the host user has configured. Otherwise
-        // a developer's cached GitHub credential quietly becomes OJO's, which
-        // works right up until it is the wrong account.
         '-c',
         'credential.helper=',
         ...args,
@@ -267,19 +169,7 @@ function git(
 
 const ASKPASS_SCRIPT = '#!/bin/sh\nexec printf \'%s\\n\' "$OJ_GIT_PASSWORD"\n';
 
-/**
- * Kill a child and everything it started.
- *
- * `child.kill()` signals one process. Both children spawned in this file start
- * others — git runs helpers, and a Claude Code worker runs a shell per Bash
- * tool call — and a grandchild that survives keeps the inherited stdout pipe
- * open, which means `close` never fires and the caller waits forever *past* the
- * timeout it just enforced. Found exactly that way: a stub worker running
- * `sleep 300` was SIGTERMed, its shell died, and `sleep` held the pipe.
- *
- * The children are spawned `detached` so they lead their own process group, and
- * a negative pid signals the whole group.
- */
+/** Kill a child and everything it started. */
 function killTree(child: { pid?: number | undefined; kill: (signal: NodeJS.Signals) => boolean }, signal: NodeJS.Signals): void {
   try {
     if (child.pid !== undefined) process.kill(-child.pid, signal);
@@ -294,15 +184,7 @@ function killTree(child: { pid?: number | undefined; kill: (signal: NodeJS.Signa
   }
 }
 
-/**
- * Delete the instruction-shaped files from the working tree.
- *
- * Patterns are either an exact repo-relative path (`.github/copilot-instructions.md`)
- * or `**​/name`, meaning that basename at any depth. That is less than a real
- * glob engine understands, and deliberately so: the list is a fixed set of
- * known file names, and a dependency that can be tricked by a cleverly-named
- * directory is worse than a matcher that only does what it says.
- */
+/** Delete the instruction-shaped files from the working tree. */
 function stripInstructionFiles(repoDir: string, patterns: string[]): string[] {
   const exact = new Set<string>();
   const anywhere = new Set<string>();
@@ -329,22 +211,7 @@ function stripInstructionFiles(repoDir: string, patterns: string[]): string[] {
   return removed;
 }
 
-/**
- * Make the same files invisible to `git diff`.
- *
- * Deleting them from the working tree is not enough on its own. The worker
- * reviews a diff, and a PR that *adds* a CLAUDE.md would have its contents
- * appear as `+` lines in that diff — instructions delivered to the reviewer
- * inside the very artefact it was asked to read. Marking the paths `-diff`
- * makes git print "Binary files differ" instead of the text.
- *
- * This lives in `.git/info/attributes`, which is not part of the repository
- * and so cannot be overridden by a `.gitattributes` in the PR.
- */
 function writeDiffAttributes(repoDir: string, patterns: string[]): void {
-  // A gitattributes pattern with no slash already matches at every depth, so
-  // `**/CLAUDE.md` and `CLAUDE.md` collapse to one rule — hence the Set, which
-  // keeps the file readable when someone is checking what was hidden and why.
   const rules = new Set<string>();
   for (const pattern of patterns) {
     const normalised = pattern.startsWith('**/') ? pattern.slice(3) : pattern;
@@ -370,14 +237,7 @@ export type CloneResult = {
   strippedPaths: string[];
 };
 
-/**
- * Fetch the PR head and its base into a per-PR directory, then scrub it.
- *
- * The head is fetched from `refs/pull/<n>/head` on the *base* repository, not
- * from the contributor's fork. That is what makes fork PRs work with one
- * credential and no extra remotes — and it means OJO never authenticates
- * against, or resolves, a repository chosen by an outsider.
- */
+/** Fetch the PR head and its base into a per-PR directory, then scrub it. */
 export async function prepareClone(request: ReviewRequest): Promise<CloneResult> {
   const { config, repo, pull, gitToken } = request;
   const workerDir = workerDirFor(config, repo.slug, pull.number);
@@ -414,11 +274,6 @@ export async function prepareClone(request: ReviewRequest): Promise<CloneResult>
     );
     if (fetch.code !== 0) throw new Error(`git fetch failed: ${fetch.stderr.trim().slice(0, 500)}`);
 
-    // A shallow fetch of two branches often lands without their common
-    // ancestor, and without a merge base there is no diff to review — only
-    // "every file in the repo changed". Deepen in steps rather than going
-    // straight to a full history, because on a large monorepo that is the
-    // difference between four seconds and four minutes.
     let mergeBase = await resolveMergeBase(repoDir);
     for (const deepen of ['--deepen=400', '--unshallow']) {
       if (mergeBase) break;
@@ -436,27 +291,12 @@ export async function prepareClone(request: ReviewRequest): Promise<CloneResult>
       );
     }
 
-    // Wipe whatever the previous round's agent left behind before checking out
-    // again. `acceptEdits` means it could write anywhere under its working
-    // directory, and reviewing a tree that a previous review edited is how you
-    // get a finding about code nobody wrote.
-    //
-    // `-ffd` and not `-ffdx`: ignored files (an installed node_modules, a build
-    // cache) are expensive to recreate and cannot carry a diff, so they are
-    // worth keeping between rounds.
     const checkout = await git(['checkout', '-q', '-f', '-B', 'oj-review', 'refs/oj/head'], {
       cwd: repoDir,
     });
     if (checkout.code !== 0) throw new Error(`git checkout failed: ${checkout.stderr.trim()}`);
     await git(['clean', '-ffdq'], { cwd: repoDir });
 
-    // ── The base-branch rule ────────────────────────────────────────────────
-    // Read with `git show refs/oj/base:OJ.md`, from the ref OJO fetched from
-    // the base branch, and never from the working tree that was just checked
-    // out. If you ever find yourself "simplifying" this to a readFileSync of
-    // `<repoDir>/OJ.md`, stop: that file is under the pull request's control,
-    // and this service would then take review instructions from the code it is
-    // reviewing.
     const instructions = await git(['show', 'refs/oj/base:OJ.md'], { cwd: repoDir });
     const repoInstructions = instructions.code === 0 ? instructions.stdout.trim() : null;
 
@@ -479,26 +319,9 @@ async function resolveMergeBase(repoDir: string): Promise<string> {
 
 // ── the prompt ───────────────────────────────────────────────────────────────
 
-/**
- * Substitute `{{name}}` placeholders, and refuse to ship an unresolved one.
- *
- * An unrecognised placeholder would otherwise reach the model as a literal
- * `{{basRef}}`, which reads as the agent having lost its place rather than as
- * a typo in a template — exactly the sort of failure that costs an hour.
- */
 export function render(template: string, values: Record<string, string>): string {
   const placeholder = /\{\{([a-zA-Z][a-zA-Z0-9_]*)\}\}/g;
 
-  // Validate the TEMPLATE, not the result. Substituted values are data — one
-  // of them is the watched repository's own OJ.md — and that data legitimately
-  // contains double braces: a Vue component, a Handlebars fixture, or in the
-  // case that found this, an OJ.md that documents this very template. Checking
-  // after substitution treats the repository's content as our typo and refuses
-  // to review it.
-  //
-  // A single `replace` pass never re-scans what it inserted, so a `{{headSha}}`
-  // arriving inside repository content is passed through untouched rather than
-  // becoming an injection point.
   const unknown = [...new Set([...template.matchAll(placeholder)].map((match) => match[1]))].filter(
     (name) => name !== undefined && values[name] === undefined,
   );
@@ -512,7 +335,6 @@ export function render(template: string, values: Record<string, string>): string
   return template.replace(placeholder, (match, name: string) => values[name] ?? match);
 }
 
-/** The numbers the reviewer opens with: size, comment lines, tests, files. */
 export async function measure(repoDir: string, base: string, head: string): Promise<string> {
   const range = `${base}..${head}`;
   const [shortstat, stat, diff] = await Promise.all([
@@ -538,14 +360,6 @@ function buildKickoff(request: ReviewRequest, clone: CloneResult, measurements: 
   );
 }
 
-/**
- * Everything `OJ.md` may interpolate.
- *
- * Exported so a test can render the shipped OJ.md against exactly the set a
- * real round supplies. `render` refuses an unknown placeholder rather than
- * passing `{{reportPath}}` through to the model as literal text, and that
- * refusal is worth catching in CI rather than forty minutes into a review.
- */
 export function kickoffValues(
   request: ReviewRequest,
   clone: CloneResult,
@@ -593,14 +407,6 @@ export function kickoffValues(
   };
 }
 
-/**
- * The prompt for a second or later round.
- *
- * Short on purpose. The session still holds round one — the workflow, the
- * dimensions, everything it concluded — so restating the full kickoff would
- * both cost a fortune in tokens and invite the agent to redo work it has
- * already done instead of looking at what changed.
- */
 function buildFollowUp(
   request: ReviewRequest,
   clone: CloneResult,
@@ -660,24 +466,6 @@ function buildFollowUp(
 
 // ── the oj CLI ───────────────────────────────────────────────────────────────
 
-/**
- * Put `oj` on the worker's PATH.
- *
- * A two-line shell script in `<workerDir>/bin`, and that directory is prepended
- * to PATH in `workerEnv`. It hard-codes the desk this review's requests belong
- * in and passes it as an environment variable rather than an argument, so there
- * is no documented way to point `oj` at another pull request's desk. That is a
- * seam, not a wall — the worker runs as the same OS user as OJO and could write
- * a file into any desk by hand — but a capability nobody has to reason about is
- * better than one that is merely discouraged. The wall is a separate user or a
- * container; README § Security model says so plainly.
- *
- * Node's own binary is `process.execPath`, which is the interpreter OJO is
- * already running under and therefore known to work. Missing `oj-cli.js` is a
- * hard error at prepare time rather than a mystery halfway through a review:
- * a worker whose only channel to GitHub is absent produces exactly the silent
- * failure this whole rework existed to remove.
- */
 export function installOjCli(workerDir: string, postedMarker: string): string {
   const binDir = join(workerDir, 'bin');
   mkdirSync(binDir, { recursive: true, mode: 0o700 });
@@ -714,26 +502,6 @@ export function installOjCli(workerDir: string, postedMarker: string): string {
 
 // ── spawning ─────────────────────────────────────────────────────────────────
 
-/**
- * Build the worker's environment from scratch.
- *
- * An allowlist, not a filter. A denylist has to anticipate every name a
- * credential might be under — `GITHUB_TOKEN`, `GH_TOKEN`, `OJ_GITHUB_*`, the
- * one someone adds next quarter — and it fails open on the one it did not
- * think of. Starting from nothing fails closed: a new secret in OJO's
- * environment simply does not reach the worker until someone chooses to add
- * it, in writing, to `worker.envPassthrough`.
- *
- * `HOME` is in the list, and it is the honest weak point of this design: it is
- * how the worker finds the Claude Code credentials it authenticates with, and
- * it is therefore also how it could find anything else in that home directory.
- * Real isolation means a separate OS user or a container. See README §
- * Security model, where this is stated plainly rather than hidden here.
- *
- * Exported for the test that asserts the live GitHub token cannot appear in the
- * result. That assertion is the single most important line of this file, and a
- * property nobody re-checks is a property that quietly stops holding.
- */
 export function workerEnv(config: OjConfig, gitToken: string, binDir: string): NodeJS.ProcessEnv {
   const allowed = [
     'PATH',
@@ -749,10 +517,6 @@ export function workerEnv(config: OjConfig, gitToken: string, binDir: string): N
     'XDG_CONFIG_HOME',
     'XDG_CACHE_HOME',
     'XDG_DATA_HOME',
-    // Without these the worker cannot reach the Anthropic API on a proxied
-    // host, and a worker that cannot reach the API produces no report at all.
-    // Note the trade: a proxy URL with credentials embedded in it would be
-    // handed over. That is the operator's own proxy, but it is worth knowing.
     ...PROXY_VARS,
     ...config.worker.envPassthrough,
   ];
@@ -763,21 +527,11 @@ export function workerEnv(config: OjConfig, gitToken: string, binDir: string): N
     if (value !== undefined) env[name] = value;
   }
 
-  // Anthropic configuration: the worker is a Claude Code session and needs
-  // whatever the operator uses to authenticate one. On a subscription install
-  // this passes nothing at all and the session reads the OAuth credentials
-  // under HOME — which is why --bare is not used, see below.
   for (const [name, value] of Object.entries(process.env)) {
     if (value !== undefined && name.startsWith('ANTHROPIC_')) env[name] = value;
   }
 
-  // Claude Code's own variables are named individually rather than taken by
-  // prefix, and the distinction is not pedantry. `CLAUDE_*` also contains
-  // per-invocation runtime markers — CLAUDE_CODE_SESSION_ID, CLAUDE_PID,
-  // CLAUDE_CODE_CHILD_SESSION — and if OJO is ever started from inside a
-  // Claude Code session, which is exactly how someone would first try it, a
-  // prefix match hands the worker its grandparent's session identity. Observed
-  // while testing this file.
+  // Claude Code's own variables are named individually, never taken by prefix.
   const CLAUDE_CONFIG_VARS = [
     'CLAUDE_CONFIG_DIR',
     'CLAUDE_CODE_USE_BEDROCK',
@@ -793,10 +547,7 @@ export function workerEnv(config: OjConfig, gitToken: string, binDir: string): N
     if (value !== undefined) env[name] = value;
   }
 
-  // Belt and braces: nothing in the resulting environment may contain the live
-  // GitHub token, whatever it is called. This catches the case the allowlist
-  // cannot — an operator adding a variable to envPassthrough whose value
-  // happens to embed the credential, such as a git URL with it inlined.
+  // Nothing in the resulting environment may contain the live GitHub token, whatever it is called.
   if (gitToken.length >= 8) {
     for (const [name, value] of Object.entries(env)) {
       if (typeof value === 'string' && value.includes(gitToken)) {
@@ -808,10 +559,7 @@ export function workerEnv(config: OjConfig, gitToken: string, binDir: string): N
     }
   }
 
-  // `oj` first, so the worker's channel to GitHub cannot be shadowed by
-  // something of that name in the repository's own tooling — and set here,
-  // after the token scrub above, so a PATH deleted for containing the
-  // credential does not come back through this line.
+  // `oj` first on PATH, so the repository's own tooling cannot shadow the worker's channel to GitHub.
   env['PATH'] = `${binDir}:${env['PATH'] ?? '/usr/bin:/bin'}`;
 
   // Any git the worker runs must fail rather than prompt. It has no credential,
@@ -833,42 +581,6 @@ type SpawnOutcome = {
   rateLimitResetsAt: number | null;
 };
 
-/**
- * Permission settings for a reviewer.
- *
- * Short, and the history behind its shortness is worth keeping, because every
- * line that is *not* here was tried and did damage.
- *
- * The first version expressed "may write exactly its report" as
- * `allow: Write(<report>)` plus `deny: Write(*), Edit(*)`. On 2026-08-10 the
- * first real review ran for sixteen minutes and returned `no-report`. Three
- * things were wrong, established by running claude against these settings
- * rather than by reading about them:
- *
- *   1. `Write(<path>)` allow rules are not matched by file permission checks
- *      at all. Claude Code says so directly: "only Edit(path) rules are. Use
- *      Edit(path) instead (Edit rules cover all file-editing tools)."
- *
- *   2. `deny: Write(*)` does not scope the Write tool — it removes it from the
- *      session. The worker reported "The Write tool isn't available in this
- *      session", finished its review, and had nothing to write the report
- *      with. It then exited 0, because from its side nothing had failed.
- *
- *   3. `deny: Edit(*)` does not restrict paths. With it set, a write to an
- *      unrelated file succeeded. Those denies were decorative, and their only
- *      real effect was breaking the one operation that mattered.
- *
- * The report file itself is gone as of 2026-08-11, and with it the `Edit()`
- * allow that was the last survivor of that mess. What remains is the Bash
- * denies, which were tested and DO hold — a denied `git push` came back
- * "Blocked — the permission system denied the call" — plus an explicit allow
- * for `oj`, so the one command a review must be able to run is never the one
- * waiting on a permission prompt that no human will answer.
- *
- * No blanket file denies. The reviewer can edit the clone, which is acceptable
- * because the clone is reset from git at the start of every round and deleted
- * when the pull request closes; the tree was never trusted between rounds.
- */
 function workerPermissionSettings(binDir: string): string {
   return JSON.stringify({
     hooks: {
@@ -891,42 +603,6 @@ function workerPermissionSettings(binDir: string): string {
 
 // ── what the journal is allowed to see ───────────────────────────────────────
 
-/**
- * Turn the worker's stream-json into a journal someone can diagnose a round from.
- *
- * Until 2026-08-16 this was one line per tool call — `tool Bash` — and nothing
- * else. On 2026-08-14 a round on Clawcius#54 ran for fifteen minutes, wrote a
- * file, went silent for 614 seconds and ended having posted nothing; every fact
- * anyone could establish about it afterwards had to be inferred from the gaps
- * between timestamps, because that log recorded neither what a call did, nor
- * whether it worked, nor how long it took. Worst of all, A REFUSAL LOOKED
- * EXACTLY LIKE A SUCCESS: a denied tool call comes back as a `tool_result` with
- * `is_error: true` and text like "This command requires approval", and nothing
- * here was reading tool results at all.
- *
- * So each call is logged twice — once when it starts, with its arguments, and
- * once when it returns, with its status and how long it took — and anything
- * still open when the process exits is named. A start with no matching end is
- * the one shape that explains a long silence from outside the session, and it
- * was unobtainable before.
- *
- * On arguments and privacy, stated as a trade rather than as a guarantee,
- * because an operator will read this to decide whether `journalctl` output is
- * safe to paste somewhere.
- *
- * The fields are named individually below, and the bulk carriers of file
- * content — `content`, `new_string`, `prompt` — are deliberately not among
- * them, so a Write is its path and never its text. That is the whole of the
- * protection, and it is not an absolute: `command` IS logged, and a shell
- * command can contain anything the worker chose to put in it, `printf '<the
- * review>' | oj comment` included. The output of a FAILED call is logged too,
- * up to `TOOL_RESULT_CHARS`, and `git diff --exit-code` fails and prints a diff.
- *
- * Both of those are the point rather than an oversight — a denial and a wedge
- * are diagnosed from the command and from what came back — but the honest
- * summary is that this journal can contain fragments of the reviewed repository,
- * chosen by the reviewer, and not that it cannot.
- */
 const LOGGED_TOOL_FIELDS = [
   'command',
   'file_path',
@@ -942,7 +618,7 @@ const LOGGED_TOOL_FIELDS = [
 /** Long enough for a real `git diff` invocation, short enough to stay one line. */
 const TOOL_ARGUMENT_CHARS = 200;
 
-/** How much of a FAILED call's output is kept. See the note on contents above. */
+/** How much of a FAILED call's output is kept. */
 const TOOL_RESULT_CHARS = 200;
 
 function oneLine(text: string, limit: number): string {
@@ -950,16 +626,6 @@ function oneLine(text: string, limit: number): string {
   return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
 }
 
-/**
- * The useful part of a tool call's input.
- *
- * An allowlist of field NAMES rather than a table per tool, because the tool set
- * is not ours to know: `Workflow` turned up in a production round without this
- * file having heard of it, and a per-tool table degrades to a bare tool name the
- * moment Claude Code ships something new. The model's own `description` is kept
- * only when nothing self-explanatory was found — beside a command or a path it
- * is a paraphrase, but beside a bare `subagent_type` it is the whole point.
- */
 const SELF_EXPLANATORY_FIELDS = new Set(['command', 'file_path', 'notebook_path', 'path', 'url']);
 
 function describeToolInput(input: unknown): string {
@@ -994,11 +660,10 @@ function toolResultText(content: unknown): string {
     .join(' ');
 }
 
-/** Whatever a round's `result` messages agreed the round cost. See `handleResult`. */
 export type StreamTotals = {
   costUsd: number;
   turns: number;
-  /** How many `result` messages this process emitted. More than one is normal; see below. */
+  /** How many `result` messages this process emitted. More than one is normal. */
   results: number;
   /** Epoch seconds at which a rejected rate limit resets, if one was hit. */
   rateLimitResetsAt: number | null;
@@ -1011,43 +676,6 @@ export type StreamMonitor = {
   readonly totals: StreamTotals;
 };
 
-/**
- * ── On there being more than one `result` line ───────────────────────────────
- *
- * Round 2 on Clawcius#54 logged `result success turns=0 $0.0000` two seconds in,
- * before any tool call, and a real `result success turns=17 $4.4044` fifteen
- * minutes later. Two things about that, both established rather than guessed.
- *
- * It was never two workers. `runReview` spawns claude once, and the single path
- * that spawns it twice logs a line of its own first. And `turns=0 $0.0000` was
- * never a measurement: the old code read `Number(message['num_turns']) || 0`,
- * so a result carrying no usage fields printed as zeros. That line recorded a
- * `result`-shaped message this file did not understand, and said "zero" about it.
- *
- * A process emits ONE result per turn it is asked to take, and it can be asked
- * more than once. Reproduced here against claude 2.1.220: a session that
- * launches an async agent emits the main turn's result and then a second one
- * carrying `"origin": {"kind": "task-notification"}` — the turn the CLI runs
- * itself when a background task reports back. Both share the parent's
- * `session_id`, and the second is not the round's total. `-p` with
- * `--session-id` and `-p` with `--resume` each emit exactly one when no subagent
- * is involved, so resuming is not what multiplies them.
- *
- * That is why the totals below take the MAXIMUM over results that actually carry
- * usage, instead of the last one: last-write-wins would report a task
- * notification's four cents as the round's cost. Whether a later result within
- * one process restates the whole process's spend or only its own turn was NOT
- * established — the maximum is right either way, which is why it is the maximum
- * and not a sum. Across two processes the costs are separate, and that WAS
- * checked: a resumed invocation reported its own spend and not the earlier
- * one's. It is also why every result is
- * logged with its `origin`, `session_id`, `stop_reason` and `terminal_reason`,
- * and why one that carries no usage fields is logged RAW. The next occurrence
- * should end that question rather than reopen it.
- *
- * Whatever it is, it cannot have ended the session early: this file only reads
- * the stream, and the round ends when the process does.
- */
 export function createStreamMonitor(onProgress: (line: string) => void): StreamMonitor {
   const totals: StreamTotals = { costUsd: 0, turns: 0, results: 0, rateLimitResetsAt: null };
   const open = new Map<string, { seq: number; name: string; arguments: string; startedAt: number }>();
@@ -1104,11 +732,7 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
   const handleSystem = (message: Record<string, unknown>): void => {
     const subtype = String(message['subtype'] ?? '');
     if (!subtype || subtype === 'init') return;
-    // `thinking_tokens` arrives dozens of times a turn and tells an operator
-    // nothing. `compact_boundary` is logged every time it happens: an
-    // auto-compact is minutes of silence, and this journal has an unexplained
-    // ten-minute gap in it. Everything else is logged the first time only, so a
-    // subtype nobody here has heard of announces itself without flooding.
+    // `thinking_tokens` arrives dozens of times a turn and tells an operator nothing.
     if (subtype === 'thinking_tokens') return;
     if (subtype !== 'compact_boundary' && seenSystemSubtypes.has(subtype)) return;
     seenSystemSubtypes.add(subtype);
@@ -1123,12 +747,6 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
     // explanations for a long gap between two lines of this journal.
     if (!status || status === 'allowed') return;
     if (info?.resetsAt) totals.rateLimitResetsAt = info.resetsAt;
-    // `resetsAt` is UNIX SECONDS. Checked rather than assumed, against a real
-    // 2.1.220 event: 1786910400, which is 2026-08-16T20:00:00Z — a five-hour
-    // window boundary. Read as milliseconds the same number is 1970-01-21, and
-    // the mistake in the other direction prints a date in the year 58000. A
-    // journal that states a confident wrong fact is worse than one that omits
-    // it, so the unit is pinned by a test.
     const resets = info?.resetsAt ? `, resets ${new Date(info.resetsAt * 1000).toISOString()}` : '';
     onProgress(`rate limit: ${status}${resets}`);
   };
@@ -1165,8 +783,7 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
     if (Number.isFinite(Number(message['duration_ms']))) {
       parts.push(`in ${(Number(message['duration_ms']) / 1000).toFixed(0)}s`);
     }
-    // A turn the CLI started for itself rather than one OJO asked for. This is
-    // what a second result line has turned out to be, so it is named.
+    // A turn the CLI started for itself rather than one OJO asked for.
     if (origin) parts.push(`origin=${oneLine(JSON.stringify(origin), 80)}`);
     if (denials.length > 0) {
       parts.push(
@@ -1213,8 +830,6 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
         `session ended: ${calls} tool call(s), ${stuck.length} never returned, ` +
           `${((Date.now() - lastMessageAt) / 1000).toFixed(0)}s since the last message`,
       );
-      // Named individually, because "which call was it sitting in" is the first
-      // question anyone asks about a round that went quiet.
       for (const call of stuck) {
         onProgress(
           `never returned: tool ${call.seq} ${call.name}${call.arguments ? ` — ${call.arguments}` : ''}` +
@@ -1239,34 +854,16 @@ function spawnClaude(
   const args = [
     '-p',
     prompt,
-    // stream-json rather than json so a forty-minute review is observable in
-    // the journal while it runs. A silent forty minutes is indistinguishable
-    // from a wedged process, and this service already asks for a lot of patience.
     '--output-format',
     'stream-json',
     '--verbose',
-    // Verified against the CLI: --session-id and --resume are mutually
-    // exclusive unless --fork-session is passed, and forking is exactly what we
-    // do not want — the point of a stable id is that round two continues round
-    // one's conversation. So the first round names the session and later rounds
-    // resume it by that name.
     ...(resume ? ['--resume', sessionId] : ['--session-id', sessionId]),
-    // Only the operator's own settings. Nothing from the repository under
-    // review, whose `.claude/settings.json` would otherwise be project scope.
     '--setting-sources',
     'user',
     // No MCP servers at all, since none are configured with --mcp-config. An
     // MCP server is a tool with credentials attached, which is the one thing
     // this worker must not have.
     '--strict-mcp-config',
-    // `auto` so the session never stops to ask a question no human is present
-    // to answer — in headless that is a hang, not a refusal. The actual limits
-    // are the deny rules below, which are narrower than any mode: a reviewer
-    // may read everything, and reaches GitHub only through `oj`.
-    //
-    // The tree is still reset from git at the start of every round. Defence in
-    // depth: a permission rule is a policy, and a policy is a thing that can be
-    // misconfigured.
     '--permission-mode',
     'auto',
     '--settings',
@@ -1278,12 +875,6 @@ function spawnClaude(
     config.paths.systemPrompt,
     ...(config.worker.model ? ['--model', config.worker.model] : []),
   ];
-
-  // Deliberately NOT --bare. It looks right for a hermetic worker, but it
-  // forces Anthropic auth to ANTHROPIC_API_KEY or an apiKeyHelper and never
-  // reads OAuth — so on a Claude subscription every worker would fail to
-  // authenticate. The isolation --bare would have bought is obtained above by
-  // naming the setting sources and the MCP policy explicitly instead.
 
   return new Promise((resolve) => {
     const child = spawn(config.worker.claudePath, args, {
@@ -1319,10 +910,6 @@ function spawnClaude(
         // Claude Code cleans up on SIGTERM, but a wedged tool call will not
         // notice it. Give it ten seconds of dignity, then stop asking.
         setTimeout(() => killTree(child, 'SIGKILL'), 10_000).unref();
-        // And resolve five seconds after that whatever happens. A grandchild
-        // holding the stdout pipe open stops `close` from ever firing, which
-        // would turn the timeout into an indefinite hang — the exact failure
-        // the timeout exists to prevent.
         setTimeout(
           () =>
             finish({
@@ -1379,29 +966,11 @@ function spawnClaude(
   });
 }
 
-/** A resume that failed because the transcript is gone, rather than for a real reason. */
 function looksLikeMissingSession(outcome: SpawnOutcome): boolean {
   return /no (conversation|session)|session .* not found|could not find session/i.test(
     outcome.stderr,
   );
 }
-
-// ── a round that said nothing ────────────────────────────────────────────────
-
-/**
- * Where OJO will look for a review the worker wrote but never posted.
- *
- * `OJ.md` tells the worker `oj comment --file review.md`, and the worker's
- * working directory is the worker directory, so these two paths are the ones the
- * instructions produce. Both are relative to `workerDir` and NEITHER IS INSIDE
- * THE CHECKOUT — that is the important line. `<repoDir>/review.md` is a file the
- * pull request can add, and reading it here would let a contributor write the
- * comment OJO posts under its own name. The checkout is material under review;
- * it is never OJO's words.
- */
-
-
-// ── the whole round ──────────────────────────────────────────────────────────
 
 export async function runReview(request: ReviewRequest, previousSha: string | null): Promise<WorkerOutcome> {
   const startedAt = Date.now();

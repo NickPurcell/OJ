@@ -1,11 +1,4 @@
-/**
- * The two worker properties that must not drift.
- *
- * `workerEnv` is the credential boundary. It is an allowlist, and an allowlist
- * is only as good as the last person who edited it, so the assertion that no
- * variable reaching the worker contains the live GitHub token is checked here
- * rather than trusted to a code comment.
- */
+/** The two worker properties that must not drift. */
 
 import assert from 'node:assert/strict';
 import {
@@ -150,11 +143,6 @@ describe('installOjCli', () => {
 
 describe('the shipped kickoff', () => {
   it('renders against exactly the values a round supplies', () => {
-    // `render` refuses an unknown placeholder rather than passing `{{...}}`
-    // through to the model as literal text. Catching that here is the
-    // difference between a failed build and a review that reads as though the
-    // reviewer has lost its place — which is how `{{reportPath}}` would have
-    // surfaced if it had been left behind when the report was retired.
     const request = {
       repo: { slug: 'NickPurcell/OJ' } as RepoConfig,
       pull: {
@@ -191,10 +179,6 @@ describe('the shipped kickoff', () => {
 });
 
 describe('createStreamMonitor', () => {
-  // The message shapes below were taken from a real `claude --output-format
-  // stream-json --verbose` run rather than from documentation, including the
-  // second `result` with an `origin` — which is what a subagent's completion
-  // looks like, and what used to be reported as the round's total.
   function monitorOver(lines: unknown[]): { logged: string[]; totals: ReturnType<typeof createStreamMonitor>['totals'] } {
     const logged: string[] = [];
     const monitor = createStreamMonitor((line) => logged.push(line));
@@ -223,8 +207,7 @@ describe('createStreamMonitor', () => {
   });
 
   it('shows a refused call as a failure, which used to be invisible', () => {
-    // The exact case: a denied tool call arrives as a tool_result with
-    // is_error, and the old log printed `tool Bash` for it and nothing more.
+    // A denied tool call arrives as a tool_result with is_error.
     const { logged } = monitorOver([
       toolUse('t1', 'Bash', { command: 'git push origin HEAD' }),
       toolResult('t1', true, [{ type: 'text', text: 'This command requires approval' }]),
@@ -243,8 +226,6 @@ describe('createStreamMonitor', () => {
     const summary = logged.find((line) => line.startsWith('session ended:'));
     assert.match(summary ?? '', /2 tool call\(s\), 1 never returned/);
     assert.ok(logged.some((line) => /never returned: tool 1 Bash — ugrep/.test(line)));
-    // A Write is logged as its path. Its text is the reviewed repository's
-    // content and has no business in the journal.
     assert.ok(logged.some((line) => line.includes('/w/review.md')));
     assert.ok(!logged.some((line) => line.includes('secret contents')));
   });
@@ -313,10 +294,6 @@ describe('createStreamMonitor', () => {
   });
 
   it('reads resetsAt as unix seconds, which is what the CLI sends', () => {
-    // 1786910400 is a real value from a 2.1.220 `rate_limit_event`, and it is a
-    // five-hour window boundary in 2026. Read as milliseconds it is 1970; the
-    // reverse mistake prints the year 58000. Either way the journal would be
-    // stating a wrong fact confidently, so the unit is pinned here.
     const { logged } = monitorOver([
       { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1786910400 } },
     ]);

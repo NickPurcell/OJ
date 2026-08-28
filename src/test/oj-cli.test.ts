@@ -1,13 +1,3 @@
-/**
- * The `oj` CLI, run as the worker runs it.
- *
- * A real child process against a real desk served by a fixtured gateway. The
- * round trip is the thing being tested — that a command writes a request, that
- * OJO's answer comes back to *that* invocation, and that the exit code tells
- * the agent whether its review reached a human. Testing the two halves
- * separately would have missed the failure this replaced, which was precisely a
- * handoff that both sides believed they had honoured.
- */
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -54,12 +44,7 @@ function recorder(): Recording {
 
 type Run = { code: number; stdout: string; stderr: string };
 
-/**
- * Start a desk, run `oj`, stop the desk.
- *
- * The desk has to be serving *while* the child blocks, which is the whole
- * shape of the mechanism — so this cannot be a spawnSync.
- */
+/** Start a desk, run `oj`, stop the desk. */
 async function run(args: string[], gateway: Recording, stdin = ''): Promise<Run> {
   const workerDir = mkdtempSync(join(tmpdir(), 'oj-cli-'));
   temporaries.push(workerDir);

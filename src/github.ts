@@ -1,17 +1,4 @@
-/**
- * Every byte OJO exchanges with GitHub goes through this file.
- *
- * That concentration is the point rather than tidiness. The credential lives
- * here and nowhere else: it is never written into a clone's `.git/config`,
- * never placed in a worker's environment, and never passed on a command line
- * where another process on the host could read it out of `ps`. If you are
- * adding a feature that needs GitHub, add a method here — do not hand the
- * token to the thing that needs it.
- *
- * No SDK. `fetch` is in Node 22 and the API surface OJO uses is eight
- * endpoints, so a dependency would mostly buy us a rate-limiter we would still
- * have to understand. Understanding it is cheaper than trusting it.
- */
+/** Every byte OJO exchanges with GitHub goes through this file. */
 
 import { createSign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -29,26 +16,8 @@ export class GitHubError extends Error {
   }
 }
 
-/**
- * A source of bearer tokens.
- *
- * Both implementations expose exactly this, so nothing downstream knows or
- * cares whether it is talking to an App installation or a PAT. That matters
- * for the quick-start path: someone who begins with a PAT and later creates
- * the App changes `.env` and restarts, and no other code moves.
- */
+/** A source of bearer tokens. */
 export interface GitHubAuth {
-  /**
-   * A JSON Web Token signed as the app, for the handful of endpoints that
-   * authenticate as the *app* rather than as an installation — `/app` being
-   * the one OJ uses. Null for a PAT, which has no such concept.
-   *
-   * This exists because the two credentials are not interchangeable and the
-   * failure is confusing: passing an installation token (`ghs_…`) to `/app`
-   * returns 401 "A JSON web token could not be decoded", which reads like a
-   * malformed key rather than the wrong credential entirely. On 2026-08-10
-   * that cost an evening's confidence in a correctly configured GitHub App.
-   */
   appJwt?(): string | null;
   /** A token good for at least the next few seconds. May mint a fresh one. */
   token(): Promise<string>;
@@ -66,18 +35,6 @@ class PatAuth implements GitHubAuth {
   }
 }
 
-/**
- * GitHub App installation auth.
- *
- * Two credentials in a trench coat: a private key signs a short JWT proving
- * "I am this app", which buys an installation token proving "and I may act on
- * these repositories". Only the second one is ever sent to the REST API or
- * used for git.
- *
- * Installation tokens last an hour. We refresh at fifty minutes, because a
- * review round can easily run for twenty and a token that expires mid-round
- * fails at the worst possible moment — after the work is done, while posting.
- */
 class AppAuth implements GitHubAuth {
   #cached: { token: string; expiresAt: number } | null = null;
   #inFlight: Promise<string> | null = null;
@@ -169,10 +126,7 @@ export function createAuth(env: AuthEnv, apiBaseUrl: string): GitHubAuth {
   return new AppAuth(env.appId, env.installationId, env.privateKeyPath, apiBaseUrl);
 }
 
-// ── The shapes OJO actually reads ────────────────────────────────────────────
-// Deliberately partial. GitHub's PR object has ninety fields; naming the nine
-// that matter documents what this service depends on, and makes an API change
-// that removes one a type error rather than an `undefined` in a template.
+// ── The shapes OJO actually reads ──────────────────────────────────────────── Deliberately partial.
 
 export type PullRequest = {
   number: number;
@@ -189,7 +143,6 @@ export type PullRequest = {
   headSha: string;
   /** True when the head branch lives in a different repository. */
   fromFork: boolean;
-  /** `owner/repo` of the head, for the review body. May be a fork. */
   headRepoSlug: string;
   labels: string[];
   updatedAt: string;
@@ -246,21 +199,8 @@ const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(do
  * The client. One per process; it holds the auth and the backoff state.
  */
 export class GitHubClient {
-  /**
-   * Retries for transient failures. Not a general retry loop — 4xx other than
-   * the rate-limit family is a bug or a permission problem, and retrying it
-   * just makes the same mistake three times before reporting it.
-   */
   static readonly #RETRY_DELAYS_MS = [1_000, 4_000, 12_000] as const;
 
-  /**
-   * Longest OJO will sit waiting for a rate limit to reset.
-   *
-   * Past this it gives up and lets the poll loop try again later. Blocking a
-   * single-threaded poll loop for forty minutes would stall every other repo
-   * and every cleanup sweep — the reset is not worth that, since nothing here
-   * is urgent enough to justify going deaf.
-   */
   static readonly #MAX_RATE_LIMIT_WAIT_MS = 5 * 60 * 1000;
 
   constructor(
@@ -272,13 +212,6 @@ export class GitHubClient {
     return this.auth.describe();
   }
 
-  /**
-   * A token for git operations, handed out only to `worker.ts`'s fetch step.
-   *
-   * It is exposed rather than used there because cloning is git's job, not
-   * fetch's. See `worker.ts` for how it reaches git without being written to
-   * disk or to a command line.
-   */
   async gitToken(): Promise<string> {
     return this.auth.token();
   }
@@ -319,10 +252,6 @@ export class GitHubClient {
       const wait = rateLimitWaitMs(response);
 
       if (wait !== null) {
-        // Both flavours land here: the primary hourly budget (403/429 with
-        // x-ratelimit-remaining: 0) and the secondary abuse limits (Retry-After
-        // on writes made too quickly). They want the same response — wait
-        // exactly as long as GitHub says and no longer.
         if (wait > GitHubClient.#MAX_RATE_LIMIT_WAIT_MS) {
           throw new GitHubError(
             response.status,
@@ -336,9 +265,6 @@ export class GitHubClient {
           `[oj] rate limited on ${method} ${path} — sleeping ${Math.round(wait / 1000)}s\n`,
         );
         await sleep(wait + 1_000);
-        // A rate-limit wait is not a retry attempt: it is the same request,
-        // deferred. Charging it against the budget would mean three sleeps and
-        // then a failure, when the first sleep was all that was needed.
         attempt -= 1;
         continue;
       }
@@ -358,7 +284,6 @@ export class GitHubClient {
     throw new Error(`GitHub ${method} ${path} failed after retries`);
   }
 
-  /** Follows `Link: rel="next"` until exhausted. */
   async #paged<T>(path: string): Promise<T[]> {
     const results: T[] = [];
     let page = 1;
@@ -405,14 +330,6 @@ export class GitHubClient {
     return created?.html_url ?? '';
   }
 
-  /**
-   * Open an issue.
-   *
-   * Reached only from the desk, and the desk supplies `owner`/`repo` from the
-   * review it is serving — never from anything the worker wrote. That is the
-   * entire safety argument for handing an agent that reads untrusted code the
-   * ability to create issues, and it lives at the call site in `index.ts`.
-   */
   async createIssue(owner: string, repo: string, title: string, body: string): Promise<string> {
     const created = await this.#request<{ html_url?: string }>(
       'POST',
@@ -460,13 +377,6 @@ export class GitHubClient {
     }));
   }
 
-  /**
-   * Remove the trigger label.
-   *
-   * A 404 is success: the label was already gone, which happens when a human
-   * removes it in the second between OJO listing the PR and acting on it.
-   * Treating that as an error would fail a review that is about to work fine.
-   */
   async removeLabel(owner: string, repo: string, number: number, label: string): Promise<void> {
     try {
       await this.#request(
@@ -484,15 +394,6 @@ export class GitHubClient {
     await this.#request('POST', `/repos/${owner}/${repo}/issues/${number}/labels`, { labels });
   }
 
-  /**
-   * Post a review — the verdict, and only the verdict.
-   *
-   * The findings are not here. As of 2026-08-11 the worker posts those itself
-   * through the `oj` CLI while it is still running, so a review event is a
-   * one-line APPROVE or REQUEST_CHANGES pointing at the comment that already
-   * exists. `index.ts` does not post one at all when the verdict maps to
-   * COMMENT, because that would be the same review twice.
-   */
   async createReview(
     owner: string,
     repo: string,
@@ -504,22 +405,12 @@ export class GitHubClient {
     await this.#request('POST', `/repos/${owner}/${repo}/pulls/${number}/reviews`, {
       event,
       body,
-      // Pinning the review to the SHA that was actually reviewed is what keeps
-      // a review from silently attaching to a commit pushed while it ran.
       ...(commitId ? { commit_id: commitId } : {}),
     });
   }
 
-  /** The account OJO is acting as. Used to notice self-review, which GitHub forbids. */
   async whoAmI(): Promise<string> {
     if (this.auth.describe().startsWith('GitHub App')) {
-      // Apps have no /user. The bot login is `<app slug>[bot]`, which /app
-      // gives us without needing the installation.
-      // `/app` authenticates as the APP, so it needs the JWT — an installation
-      // token is rejected with 401 "A JSON web token could not be decoded",
-      // which sounds like a broken key and is not. Everything else in this
-      // client correctly uses the installation token, which is why minting and
-      // listing worked while only this call failed.
       const jwt = this.auth.appJwt?.() ?? null;
       if (!jwt) return '';
       const response = await fetch(`${this.apiBaseUrl}/app`, {
@@ -541,14 +432,6 @@ export class GitHubClient {
   }
 }
 
-/**
- * How long to wait, or null if this response is not a rate limit.
- *
- * Three signals, checked in the order GitHub documents them: `retry-after` on
- * secondary limits, `x-ratelimit-reset` when the primary budget is exhausted,
- * and a bare 429 with neither (treated as a minute, because something is
- * throttling us even if it will not say for how long).
- */
 function rateLimitWaitMs(response: Response): number | null {
   if (response.status !== 403 && response.status !== 429) return null;
 

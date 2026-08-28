@@ -1,45 +1,9 @@
-/**
- * `oj` — the review worker's only channel to GitHub.
- *
- * This file runs *inside* the worker: same OS user, no credential, reading a
- * repository written by whoever opened the pull request. It therefore does
- * exactly one thing that could be called privileged, and it does it by asking:
- * it writes a small JSON file into the desk directory OJO created for this
- * review, waits for OJO to write an answer back, prints it and exits.
- *
- * Two consequences worth stating, because both are load-bearing.
- *
- * IT HOLDS NO CREDENTIAL. There is no token in this process, in its
- * environment, or in any file it reads. `oj` cannot talk to GitHub; OJO can,
- * and does, on its behalf. Nothing here needs auditing for leaks because there
- * is nothing to leak.
- *
- * IT CANNOT NAME A TARGET. There is no `--repo`, no `--pr`, no URL argument,
- * and passing something that looks like one is a refusal with an explanation
- * rather than an unrecognised flag. The desk this process writes to *is* the
- * addressing: OJO knows which pull request it created that desk for. See
- * `desk.ts` for why identity comes from the channel and never from the message.
- *
- * `oj` blocks until the answer arrives and exits non-zero when the operation
- * failed, so the agent can react — say so in its review, retry, or fall back —
- * instead of discovering after the fact that its work went nowhere. That is the
- * whole reason this replaced `oj/report.json`, which could fail silently, at the
- * end, in a way the agent had no way to see.
- */
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { deskDirs, MAX_BODY_CHARS, writeAtomic, type DeskResult } from './desk.js';
 
-/**
- * How long `oj` waits for OJO before giving up.
- *
- * Generous: OJO drains twice a second, but a GitHub call underneath can sit out
- * a rate limit for minutes, and the worst outcome is an agent that concludes
- * its comment was lost and posts it twice. Shorter than the round timeout so
- * that a dead OJO surfaces as a failed command rather than a hung session.
- */
 const WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const POLL_MS = 200;
 
@@ -130,14 +94,6 @@ function readFileOrFail(path: string): string {
   }
 }
 
-/**
- * Hand the request over and wait for the answer.
- *
- * The name carries a millisecond timestamp so the desk serves requests in the
- * order they were made, and random bytes so two `oj` calls in the same
- * millisecond cannot collide. Written with rename-into-place, because a drain
- * that lists a half-written file would reject it as malformed JSON.
- */
 function submit(request: Record<string, unknown>): DeskResult {
   const deskRoot = process.env['OJ_DESK'];
   if (!deskRoot) {
@@ -159,8 +115,6 @@ function submit(request: Record<string, unknown>): DeskResult {
   for (;;) {
     if (existsSync(resultPath)) {
       const raw = readFileSync(resultPath, 'utf8');
-      // Read once and remove: the desk never reuses a name, and leaving results
-      // behind would turn the directory into a slow leak over a long review.
       rmSync(resultPath, { force: true });
       try {
         return JSON.parse(raw) as DeskResult;
@@ -233,12 +187,7 @@ function main(): void {
   }
 }
 
-/**
- * Print the answer and exit accordingly.
- *
- * Payload on stdout, prose on stderr, so `oj pr > facts.md` is a file of facts
- * rather than a file of facts with a status line stapled to the end.
- */
+/** Print the answer and exit accordingly. */
 function report(result: DeskResult): never {
   if (result.data !== undefined) process.stdout.write(result.data.endsWith('\n') ? result.data : `${result.data}\n`);
   process.stderr.write(`oj ${result.action}: ${result.ok ? '' : 'FAILED — '}${result.detail}\n`);
