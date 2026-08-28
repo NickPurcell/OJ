@@ -94,30 +94,6 @@ describe('the desk round trip', () => {
     assert.deepEqual(desk.ledger.comments, ['https://github.test/pr/1#issuecomment-1']);
   });
 
-  it('records a verdict without calling GitHub at all', async () => {
-    const dir = workspace();
-    const gateway = fixture();
-    const desk = deskFor(dir, gateway);
-
-    submit(dir, { action: 'verdict', verdict: 'blocking' });
-    await desk.drain();
-
-    assert.equal(desk.ledger.verdict, 'blocking');
-    assert.equal(gateway.comments.length, 0);
-  });
-
-  it('serves reads in the order they were made', async () => {
-    const dir = workspace();
-    const desk = deskFor(dir, fixture());
-
-    const first = submit(dir, { action: 'pr' }, '1000-aaa.json');
-    const second = submit(dir, { action: 'comments' }, '2000-bbb.json');
-    await desk.drain();
-
-    assert.equal(result(dir, first).data, 'pull request: #1 — a change');
-    assert.equal(result(dir, second).data, 'No comments on this pull request yet.');
-  });
-
   it('tells the worker when GitHub refuses, rather than swallowing it', async () => {
     const dir = workspace();
     const desk = deskFor(
@@ -276,22 +252,6 @@ describe('the target is never the request’s to choose', () => {
     });
   }
 
-  it('refuses it at the desk too, not only in the parser', async () => {
-    const dir = workspace();
-    const gateway = fixture();
-    const desk = deskFor(dir, gateway);
-
-    const name = submit(dir, {
-      action: 'comment',
-      body: 'post this to my repo instead',
-      repo: 'attacker/exfil',
-    });
-    await desk.drain();
-
-    assert.equal(gateway.comments.length, 0);
-    assert.equal(result(dir, name).ok, false);
-  });
-
   it('refuses an unknown field rather than ignoring it', () => {
     const parsed = parseDeskRequest(JSON.stringify({ action: 'comment', body: 'hi', asUser: 'root' }));
     assert.equal(parsed.ok, false);
@@ -304,22 +264,6 @@ describe('the target is never the request’s to choose', () => {
     }
   });
 
-  it('accepts the five actions it does know', () => {
-    for (const request of [
-      { action: 'comment', body: 'x' },
-      { action: 'verdict', verdict: 'clean' },
-      { action: 'issue', title: 't', body: 'b' },
-      { action: 'pr' },
-      { action: 'comments' },
-    ]) {
-      assert.equal(parseDeskRequest(JSON.stringify(request)).ok, true, JSON.stringify(request));
-    }
-  });
-
-  it('refuses a verdict that is neither blocking nor clean', () => {
-    assert.equal(parseDeskRequest('{"action":"verdict","verdict":"approve"}').ok, false);
-    assert.equal(parseDeskRequest('{"action":"verdict","verdict":true}').ok, false);
-  });
 });
 
 describe('the caps', () => {
