@@ -111,7 +111,7 @@ export function workerDirFor(config: OjConfig, slug: string, prNumber: number): 
   return join(config.paths.workersRoot, `${slug.replace(/\//g, '__')}__${prNumber}`);
 }
 
-export type WorkerFailure = 'clone-failed' | 'spawn-failed' | 'timeout' | 'said-nothing';
+export type WorkerFailure = 'clone-failed' | 'spawn-failed' | 'timeout' | 'said-nothing' | 'rate-limited';
 
 export type WorkerOutcome =
   | {
@@ -135,6 +135,8 @@ export type WorkerOutcome =
       durationMs: number;
       /** Present even on failure: the worker may have opened issues before dying. */
       ledger: DeskLedger;
+      /** When OJO should try again by itself, or null when a re-label is needed. */
+      retryAfter: number | null;
     };
 
 export type ReviewRequest = {
@@ -828,6 +830,7 @@ type SpawnOutcome = {
   stderr: string;
   costUsd: number;
   turns: number;
+  rateLimitResetsAt: number | null;
 };
 
 /**
@@ -997,6 +1000,8 @@ export type StreamTotals = {
   turns: number;
   /** How many `result` messages this process emitted. More than one is normal; see below. */
   results: number;
+  /** Epoch seconds at which a rejected rate limit resets, if one was hit. */
+  rateLimitResetsAt: number | null;
 };
 
 export type StreamMonitor = {
@@ -1044,7 +1049,7 @@ export type StreamMonitor = {
  * the stream, and the round ends when the process does.
  */
 export function createStreamMonitor(onProgress: (line: string) => void): StreamMonitor {
-  const totals: StreamTotals = { costUsd: 0, turns: 0, results: 0 };
+  const totals: StreamTotals = { costUsd: 0, turns: 0, results: 0, rateLimitResetsAt: null };
   const open = new Map<string, { seq: number; name: string; arguments: string; startedAt: number }>();
   const seenSystemSubtypes = new Set<string>();
   let calls = 0;
@@ -1117,6 +1122,7 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
     // means the session is about to sit still, which is one of the few honest
     // explanations for a long gap between two lines of this journal.
     if (!status || status === 'allowed') return;
+    if (info?.resetsAt) totals.rateLimitResetsAt = info.resetsAt;
     // `resetsAt` is UNIX SECONDS. Checked rather than assumed, against a real
     // 2.1.220 event: 1786910400, which is 2026-08-16T20:00:00Z — a five-hour
     // window boundary. Read as milliseconds the same number is 1970-01-21, and
@@ -1326,6 +1332,7 @@ function spawnClaude(
               stderr: `${stderr}\nworker did not exit after SIGKILL; abandoned`,
               costUsd: monitor.totals.costUsd,
               turns: monitor.totals.turns,
+              rateLimitResetsAt: monitor.totals.rateLimitResetsAt,
             }),
           15_000,
         ).unref();
@@ -1354,6 +1361,7 @@ function spawnClaude(
         stderr: `${stderr}\n${error.message}`,
         costUsd: monitor.totals.costUsd,
         turns: monitor.totals.turns,
+        rateLimitResetsAt: monitor.totals.rateLimitResetsAt,
       });
     });
 
@@ -1365,6 +1373,7 @@ function spawnClaude(
         stderr,
         costUsd: monitor.totals.costUsd,
         turns: monitor.totals.turns,
+        rateLimitResetsAt: monitor.totals.rateLimitResetsAt,
       });
     });
   });
@@ -1412,6 +1421,7 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
       workerDir,
       durationMs: Date.now() - startedAt,
       ledger,
+      retryAfter: null,
     };
   }
   for (const stale of ['review.md', join('oj', 'review.md')]) {
@@ -1450,14 +1460,11 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
   }
   const durationMs = Date.now() - startedAt;
   if (ledger.comments.length === 0) {
-    const failure = (reason: WorkerFailure, detail: string): WorkerOutcome => ({
-      ok: false,
-      reason,
-      detail,
-      workerDir,
-      durationMs,
-      ledger,
-    });
+    const failure = (
+      reason: WorkerFailure,
+      detail: string,
+      retryAfter: number | null = null,
+    ): WorkerOutcome => ({ ok: false, reason, detail, workerDir, durationMs, ledger, retryAfter });
     if (outcome.timedOut) {
       return failure(
         'timeout',
@@ -1471,6 +1478,14 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
         'said-nothing',
         'the worker finished without posting a comment, even after being told to at the end of its ' +
           'turn. Its findings, if any, are in the session; re-labelling the PR resumes it.',
+      );
+    }
+    if (outcome.rateLimitResetsAt !== null) {
+      const resetsAt = outcome.rateLimitResetsAt * 1000;
+      return failure(
+        'rate-limited',
+        `the API rate limit was hit before anything was posted; it resets at ${new Date(resetsAt).toISOString()}.`,
+        resetsAt + 60_000,
       );
     }
     return failure(

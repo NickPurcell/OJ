@@ -24,8 +24,10 @@ export type PrRecord = {
   sessionId: string;
   /** How many review rounds have run. Round 1 starts the session; later rounds resume it. */
   rounds: number;
-  /** Head SHA of the last completed review, so an unchanged PR is not re-reviewed. */
+  /** Head SHA of the last completed review; the next round's diff starts here. */
   lastReviewedHeadSha: string | null;
+  /** Epoch ms after which a rate-limited round is retried without a re-label. */
+  retryAfter: number | null;
   createdAt: number;
   lastActivityAt: number;
 };

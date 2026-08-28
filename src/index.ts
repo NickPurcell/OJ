@@ -30,6 +30,7 @@ import {
 import {
   decideEvent,
   failureComment,
+  rateLimitedComment,
   renderComments,
   renderPullFacts,
   verdictBody,
@@ -87,7 +88,7 @@ let stopping = false;
 /** PRs with a review in flight, so a slow round is not started twice by the next tick. */
 const inFlight = new Set<string>();
 
-type Trigger = 'label' | 'new';
+type Trigger = 'label' | 'new' | 'retry';
 
 type QueuedReview = {
   repo: RepoConfig;
@@ -108,12 +109,12 @@ type QueuedReview = {
  */
 function decide(repo: RepoConfig, pull: PullRequest, baseline: number): Trigger | null {
   if (pull.labels.includes(repo.reviewLabel)) return 'label';
-
+  const existing = state.get(repo.slug, pull.number);
+  if (existing?.retryAfter && Date.now() >= existing.retryAfter) return 'retry';
   if (!repo.reviewNewPrs) return null;
   if (pull.number <= baseline) return null;
-  // Any prior record means this PR has been seen and handled before, so the
-  // "new PR" trigger has already fired for it. Further rounds come from the label.
-  if (state.get(repo.slug, pull.number)) return null;
+  // A prior record means the "new PR" trigger already fired; further rounds come from the label.
+  if (existing) return null;
   return 'new';
 }
 
@@ -260,6 +261,7 @@ async function review(queued: QueuedReview): Promise<void> {
     // claim to have looked at this commit, or the follow-up prompt would tell
     // the next round to diff against something nobody reviewed.
     lastReviewedHeadSha: outcome.ok ? pull.headSha : (existing?.lastReviewedHeadSha ?? null),
+    retryAfter: !outcome.ok && outcome.reason === 'rate-limited' ? outcome.retryAfter : null,
     createdAt: existing?.createdAt ?? Date.now(),
     lastActivityAt: Date.now(),
   });
@@ -278,7 +280,9 @@ async function review(queued: QueuedReview): Promise<void> {
         repo.owner,
         repo.repo,
         pull.number,
-        failureComment(outcome.reason, outcome.detail, repo.reviewLabel),
+        outcome.reason === 'rate-limited'
+          ? rateLimitedComment(outcome.retryAfter)
+          : failureComment(outcome.reason, outcome.detail, repo.reviewLabel),
       );
     } catch (error) {
       warn(`${key}: could not report the failure either — ${String(error)}`);
