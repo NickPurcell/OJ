@@ -65,6 +65,7 @@ async function run(args: string[], gateway: Recording, stdin = ''): Promise<Run>
   temporaries.push(workerDir);
   const desk = new Desk({
     workerDir,
+    postedMarker: join(workerDir, 'posted'),
     gateway,
     footer: '<sub>OJ · round 2</sub>',
     maxComments: 10,

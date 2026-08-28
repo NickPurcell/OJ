@@ -63,6 +63,7 @@ function fixture(overrides: Partial<DeskGateway> = {}): DeskGateway & {
 function deskFor(workerDir: string, gateway: DeskGateway, caps: { comments?: number; issues?: number } = {}): Desk {
   return new Desk({
     workerDir,
+    postedMarker: join(workerDir, 'posted'),
     gateway,
     footer: '<sub>OJ · round 1</sub>',
     maxComments: caps.comments ?? 10,

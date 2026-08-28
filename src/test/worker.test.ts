@@ -22,16 +22,14 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import type { OjConfig, RepoConfig } from '../config.js';
 import { deskPaths } from '../desk.js';
 import type { PullRequest } from '../github.js';
 import {
-  archivedReviewPath,
-  archiveStaleReviews,
   createStreamMonitor,
-  findWrittenReview,
   installOjCli,
   kickoffValues,
   render,
@@ -127,7 +125,7 @@ describe('installOjCli', () => {
     const workerDir = mkdtempSync(join(tmpdir(), 'oj-worker-'));
     temporaries.push(workerDir);
 
-    const binDir = installOjCli(workerDir);
+    const binDir = installOjCli(workerDir, join(workerDir, 'posted'));
     const script = readFileSync(join(binDir, 'oj'), 'utf8');
 
     assert.ok(existsSync(join(binDir, 'oj')));
@@ -135,6 +133,18 @@ describe('installOjCli', () => {
     // The desk is passed as an environment variable, not an argument: there is
     // no documented way to aim `oj` at another pull request's desk.
     assert.doesNotMatch(script, /--desk/);
+  });
+  it('writes a Stop hook that refuses once, then yields', () => {
+    const workerDir = mkdtempSync(join(tmpdir(), 'oj-worker-'));
+    temporaries.push(workerDir);
+    const marker = join(workerDir, 'posted');
+    const binDir = installOjCli(workerDir, marker);
+    const hook = join(binDir, 'oj-stop-check');
+    const run = (input: string): number => spawnSync('/bin/sh', [hook], { input }).status ?? -1;
+    assert.equal(run('{"stop_hook_active":false}'), 2);
+    assert.equal(run('{"stop_hook_active":true}'), 0);
+    writeFileSync(marker, 'https://example.test/1\n');
+    assert.equal(run('{"stop_hook_active":false}'), 0);
   });
 });
 
@@ -312,185 +322,6 @@ describe('createStreamMonitor', () => {
     ]);
 
     assert.equal(logged[0], 'rate limit: rejected, resets 2026-08-16T20:00:00.000Z');
-  });
-});
-
-describe('findWrittenReview', () => {
-  function workerDirWith(files: Record<string, string>): string {
-    const workerDir = mkdtempSync(join(tmpdir(), 'oj-review-'));
-    temporaries.push(workerDir);
-    for (const [name, content] of Object.entries(files)) {
-      const path = join(workerDir, name);
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, content);
-    }
-    return workerDir;
-  }
-
-  it('finds the review the worker was told to write', () => {
-    const workerDir = workerDirWith({ 'review.md': '## Findings\n\nsomething' });
-
-    const search = findWrittenReview(workerDir, Date.now() - 60_000);
-
-    assert.equal(search.found?.path, join(workerDir, 'review.md'));
-    assert.match(search.found?.body ?? '', /## Findings/);
-  });
-
-  it('leaves an earlier round’s review alone', () => {
-    // The worker directory outlives a round, so round 2 finds round 1's file
-    // sitting there. Posting it would be a confident review of code nobody read.
-    const workerDir = workerDirWith({ 'review.md': 'round one' });
-    const old = new Date(Date.now() - 86_400_000);
-    utimesSync(join(workerDir, 'review.md'), old, old);
-
-    const search = findWrittenReview(workerDir, Date.now() - 60_000);
-
-    assert.equal(search.found, null);
-    assert.ok(search.notes.some((note) => note.kind === 'stale'));
-  });
-
-  it('never reads the checkout, which the pull request controls', () => {
-    const workerDir = workerDirWith({
-      'repo/review.md': 'a review written by the pull request itself',
-    });
-
-    const search = findWrittenReview(workerDir, Date.now() - 60_000);
-
-    assert.equal(search.found, null);
-    for (const path of search.checked) assert.ok(!path.includes(`${'repo'}/`));
-  });
-
-  it('refuses a symlink rather than following it', () => {
-    const workerDir = workerDirWith({ 'elsewhere.md': 'not mine to post' });
-    symlinkSync(join(workerDir, 'elsewhere.md'), join(workerDir, 'review.md'));
-
-    const search = findWrittenReview(workerDir, Date.now() - 60_000);
-
-    assert.equal(search.found, null);
-    assert.ok(search.notes.some((note) => note.kind === 'unusable' && note.text.includes('not a regular file')));
-  });
-
-  it('separates a stale file from one this round could not use', () => {
-    // The two want opposite instructions: one must be written afresh, the other
-    // merely posted. A prompt that says "fix that and post it" about a stale
-    // file asks for a confident review of code nobody looked at.
-    const workerDir = workerDirWith({ 'review.md': 'round one', 'oj/review.md': '  ' });
-    const old = new Date(Date.now() - 86_400_000);
-    utimesSync(join(workerDir, 'review.md'), old, old);
-
-    const search = findWrittenReview(workerDir, Date.now() - 60_000);
-
-    assert.deepEqual(
-      search.notes.map((note) => note.kind),
-      ['stale', 'unusable'],
-    );
-  });
-
-  it('calls an earlier round’s symlink stale, not something this round wrote', () => {
-    // Age before shape. `unusable` is what makes the follow-up prompt say "you
-    // wrote a review file this round", and an earlier round's leftovers are not
-    // this round's work whatever shape they are in.
-    const workerDir = workerDirWith({ 'elsewhere.md': 'not mine' });
-    symlinkSync(join(workerDir, 'elsewhere.md'), join(workerDir, 'review.md'));
-    const old = new Date(Date.now() - 86_400_000);
-    // lutimes, not utimes: utimes follows the link and would date the target.
-    lutimesSync(join(workerDir, 'review.md'), old, old);
-
-    const search = findWrittenReview(workerDir, Date.now() - 60_000);
-
-    assert.equal(search.found, null);
-    assert.equal(search.notes[0]?.kind, 'stale');
-  });
-
-  it('names every path it looked at, so a failure can say so', () => {
-    const workerDir = workerDirWith({ 'review.md': '   \n' });
-
-    const search = findWrittenReview(workerDir, Date.now() - 60_000);
-
-    assert.equal(search.found, null);
-    assert.deepEqual(search.checked, [
-      join(workerDir, 'review.md'),
-      join(workerDir, 'oj', 'review.md'),
-    ]);
-    assert.ok(search.notes.some((note) => note.kind === 'unusable' && note.text.includes('is empty')));
-  });
-});
-
-describe('archiveStaleReviews', () => {
-  function workerDirWith(files: Record<string, string>): string {
-    const workerDir = mkdtempSync(join(tmpdir(), 'oj-archive-'));
-    temporaries.push(workerDir);
-    for (const [name, content] of Object.entries(files)) {
-      const path = join(workerDir, name);
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, content);
-    }
-    return workerDir;
-  }
-
-  it('moves an earlier round’s review aside, and keeps it', () => {
-    const workerDir = workerDirWith({ 'review.md': 'round one' });
-    const old = new Date(Date.now() - 86_400_000);
-    utimesSync(join(workerDir, 'review.md'), old, old);
-
-    const moved = archiveStaleReviews(workerDir, Date.now() - 60_000);
-
-    assert.equal(moved.length, 1);
-    assert.ok(!existsSync(join(workerDir, 'review.md')));
-    // Renamed, not deleted: a review OJO failed to post is evidence, and the
-    // failure comment says it is still there.
-    const kept = readdirSync(join(workerDir, 'oj'));
-    assert.equal(kept.length, 1);
-    assert.match(kept[0] ?? '', /^review-superseded-/);
-    assert.equal(readFileSync(join(workerDir, 'oj', kept[0] as string), 'utf8'), 'round one');
-  });
-
-  it('keeps both archives when two files share a millisecond', () => {
-    // `renameSync` overwrites, so a name built from the timestamp alone loses
-    // one of them while the caller reports both as kept.
-    const workerDir = workerDirWith({ 'review.md': 'root one', 'oj/review.md': 'nested one' });
-    const old = new Date(Date.now() - 86_400_000);
-    for (const name of ['review.md', join('oj', 'review.md')]) {
-      utimesSync(join(workerDir, name), old, old);
-    }
-
-    const moved = archiveStaleReviews(workerDir, Date.now() - 60_000);
-
-    assert.equal(moved.length, 2);
-    const kept = readdirSync(join(workerDir, 'oj')).sort();
-    assert.equal(kept.length, 2, 'one archive overwrote the other');
-    assert.deepEqual(
-      kept.map((name) => readFileSync(join(workerDir, 'oj', name), 'utf8')).sort(),
-      ['nested one', 'root one'],
-    );
-  });
-
-  it('puts a stale review where the failure comment said it would', () => {
-    // The failure comment names this path, and a human follows it after
-    // re-labelling. The two must be one function, and they are.
-    const workerDir = workerDirWith({ 'review.md': 'round one' });
-    const old = new Date(Date.now() - 86_400_000);
-    utimesSync(join(workerDir, 'review.md'), old, old);
-    // From the same source the failure comment uses: what the filesystem
-    // reports, not what we asked it to store.
-    const promised = archivedReviewPath(
-      workerDir,
-      'review.md',
-      lstatSync(join(workerDir, 'review.md')).mtimeMs,
-    );
-
-    archiveStaleReviews(workerDir, Date.now() - 60_000);
-
-    assert.equal(readFileSync(promised, 'utf8'), 'round one');
-  });
-
-  it('leaves this round’s own review exactly where the worker put it', () => {
-    const workerDir = workerDirWith({ 'review.md': 'this round' });
-
-    const moved = archiveStaleReviews(workerDir, Date.now() - 60_000);
-
-    assert.deepEqual(moved, []);
-    assert.equal(readFileSync(join(workerDir, 'review.md'), 'utf8'), 'this round');
   });
 });
 

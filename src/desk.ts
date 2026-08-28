@@ -282,6 +282,8 @@ export type DeskOptions = {
   gateway: DeskGateway;
   /** Appended to every comment before it is posted. OJO's words, not the worker's. */
   footer: string;
+  /** Written when a comment lands; the worker's Stop hook checks for it. */
+  postedMarker: string;
   /** Ceiling on comments in one round. An injected worker should not be able to flood. */
   maxComments: number;
   /** Ceiling on issues in one round. Same reason, and issues are harder to clean up. */
@@ -450,6 +452,7 @@ export class Desk {
             `${request.body.trimEnd()}\n\n${this.#options.footer}`,
           );
           this.#ledger.comments.push(url);
+          writeFileSync(this.#options.postedMarker, `${url}\n`);
           return { ok: true, action: 'comment', detail: `posted ${url}` };
         }
         case 'verdict': {
