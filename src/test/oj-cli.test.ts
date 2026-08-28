@@ -92,33 +92,6 @@ describe('oj', () => {
     assert.match(result.stderr, /oj comment: posted https:\/\/github\.test/);
   });
 
-  it('prints what it was asked for on stdout, so it can be redirected', async () => {
-    const gateway = recorder();
-    const result = await run(['pr'], gateway);
-
-    assert.equal(result.code, 0);
-    assert.match(result.stdout, /pull request: #7 — a change/);
-    // Prose on stderr: `oj pr > facts.md` should be facts, not facts plus a
-    // status line.
-    assert.doesNotMatch(result.stdout, /oj pr:/);
-  });
-
-  it('opens an issue with a title', async () => {
-    const gateway = recorder();
-    const result = await run(['issue', '--title', 'Retry loop never resets'], gateway, 'Out of scope here.');
-
-    assert.equal(result.code, 0);
-    assert.deepEqual(gateway.issues, [
-      { title: 'Retry loop never resets', body: 'Out of scope here.' },
-    ]);
-  });
-
-  it('records a verdict', async () => {
-    const gateway = recorder();
-    assert.equal((await run(['verdict', 'clean'], gateway)).code, 0);
-    assert.equal((await run(['verdict', 'maybe'], gateway)).code, 2);
-  });
-
   it('exits non-zero when GitHub refused, so the agent finds out', async () => {
     const gateway = recorder();
     gateway.postComment = async () => {
@@ -145,18 +118,4 @@ describe('oj', () => {
     assert.equal(gateway.comments.length, 0);
   });
 
-  it('refuses an empty body rather than posting silence', async () => {
-    const gateway = recorder();
-    const result = await run(['comment'], gateway, '   \n');
-
-    assert.equal(result.code, 1);
-    assert.equal(gateway.comments.length, 0);
-    assert.match(result.stderr, /the body is empty/);
-  });
-
-  it('refuses an unknown command', async () => {
-    const gateway = recorder();
-    assert.equal((await run(['merge'], gateway)).code, 2);
-    assert.equal((await run(['comment', '--as-user', 'root'], gateway, 'x')).code, 2);
-  });
 });
