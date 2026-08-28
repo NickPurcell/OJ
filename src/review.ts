@@ -1,5 +1,4 @@
 
-import type { RepoConfig } from './config.js';
 import type { Verdict } from './desk.js';
 import type { PullRequest, ReviewEvent } from './github.js';
 
@@ -9,22 +8,20 @@ export type VerdictDecision = {
   downgraded: boolean;
 };
 
+export const ACKNOWLEDGEMENT =
+  '🧬 OJ is reviewing this pull request. I will post findings here when the ' +
+  'sweep finishes — if nothing appears within the hour, something broke on my end.';
+
 export function decideEvent(
   verdict: Verdict | null,
-  repo: RepoConfig,
+  approve: boolean,
   pull: PullRequest,
   identity: string,
 ): VerdictDecision {
   const wanted: ReviewEvent =
-    verdict === 'blocking'
-      ? repo.requestChangesWhenBlocking
-        ? 'REQUEST_CHANGES'
-        : 'COMMENT'
-      : verdict === 'clean' && repo.approveWhenClean
-        ? 'APPROVE'
-        : 'COMMENT';
+    verdict === 'blocking' ? 'REQUEST_CHANGES' : verdict === 'clean' ? 'APPROVE' : 'COMMENT';
 
-  if (repo.verdictMode !== 'full') {
+  if (!approve) {
     return { event: 'COMMENT', wanted, downgraded: wanted !== 'COMMENT' };
   }
   if (identity && pull.authorLogin === identity && wanted !== 'COMMENT') {
@@ -33,10 +30,10 @@ export function decideEvent(
   return { event: wanted, wanted, downgraded: false };
 }
 
-export function commentFooter(round: number, headSha: string, verdictMode: string): string {
+export function commentFooter(round: number, headSha: string, approve: boolean): string {
   const parts = [`OJ · round ${round} · head \`${headSha.slice(0, 8)}\``];
-  if (verdictMode !== 'full') {
-    parts.push('`verdictMode: comment` — this review cannot approve or block');
+  if (!approve) {
+    parts.push('`approve: false` — this review cannot approve or block');
   }
   parts.push('instructions read from the base branch only');
   return `<sub>${parts.join(' · ')}</sub>`;

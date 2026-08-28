@@ -2,7 +2,7 @@
 
 import { createSign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import type { AuthEnv } from './config.js';
+import { GITHUB_API, type AuthEnv } from './config.js';
 
 export class GitHubError extends Error {
   constructor(
@@ -18,21 +18,11 @@ export class GitHubError extends Error {
 
 /** A source of bearer tokens. */
 export interface GitHubAuth {
-  appJwt?(): string | null;
+  appJwt(): string | null;
   /** A token good for at least the next few seconds. May mint a fresh one. */
   token(): Promise<string>;
   /** For logs and the startup banner. Never includes the credential. */
   describe(): string;
-}
-
-class PatAuth implements GitHubAuth {
-  constructor(private readonly value: string) {}
-  async token(): Promise<string> {
-    return this.value;
-  }
-  describe(): string {
-    return 'personal access token';
-  }
 }
 
 class AppAuth implements GitHubAuth {
@@ -121,9 +111,8 @@ class AppAuth implements GitHubAuth {
   }
 }
 
-export function createAuth(env: AuthEnv, apiBaseUrl: string): GitHubAuth {
-  if (env.kind === 'pat') return new PatAuth(env.token);
-  return new AppAuth(env.appId, env.installationId, env.privateKeyPath, apiBaseUrl);
+export function createAuth(env: AuthEnv): GitHubAuth {
+  return new AppAuth(env.appId, env.installationId, env.privateKeyPath, GITHUB_API);
 }
 
 // ── The shapes OJO actually reads ──────────────────────────────────────────── Deliberately partial.
@@ -402,7 +391,7 @@ export class GitHubClient {
 
   async whoAmI(): Promise<string> {
     if (this.auth.describe().startsWith('GitHub App')) {
-      const jwt = this.auth.appJwt?.() ?? null;
+      const jwt = this.auth.appJwt();
       if (!jwt) return '';
       const response = await fetch(`${this.apiBaseUrl}/app`, {
         headers: {
