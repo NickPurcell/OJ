@@ -37,11 +37,7 @@ after(() => {
   for (const dir of temporaries) rmSync(dir, { recursive: true, force: true });
 });
 
-function configWith(envPassthrough: string[]): OjConfig {
-  // Only `worker.envPassthrough` is read by workerEnv; the rest of an OjConfig
-  // is irrelevant to it and inventing a whole one would hide that.
-  return { worker: { envPassthrough } } as unknown as OjConfig;
-}
+const config = {} as OjConfig;
 
 function withEnv<T>(overrides: Record<string, string>, body: () => T): T {
   const saved = new Map<string, string | undefined>();
@@ -64,7 +60,7 @@ describe('workerEnv', () => {
 
   it('does not pass GITHUB_TOKEN, whatever else is in the environment', () => {
     const env = withEnv({ GITHUB_TOKEN: token, GH_TOKEN: token, OJ_GITHUB_TOKEN: token }, () =>
-      workerEnv(configWith([]), token, '/tmp/bin'),
+      workerEnv(config, token, '/tmp/bin'),
     );
 
     assert.equal(env['GITHUB_TOKEN'], undefined);
@@ -75,27 +71,10 @@ describe('workerEnv', () => {
     }
   });
 
-  it('drops an allowlisted variable that happens to embed the token', () => {
-    // The case the allowlist cannot catch by name: an operator passes through a
-    // variable whose *value* is a git URL with the credential inlined.
-    const env = withEnv(
-      { GITHUB_TOKEN: token, OJ_TEST_MIRROR: `https://x-access-token:${token}@github.com/a/b.git` },
-      () => workerEnv(configWith(['OJ_TEST_MIRROR']), token, '/tmp/bin'),
-    );
 
-    assert.equal(env['OJ_TEST_MIRROR'], undefined);
-  });
-
-  it('passes through what it was told to, when that is harmless', () => {
-    const env = withEnv({ GITHUB_TOKEN: token, OJ_TEST_PLAIN: 'harmless' }, () =>
-      workerEnv(configWith(['OJ_TEST_PLAIN']), token, '/tmp/bin'),
-    );
-
-    assert.equal(env['OJ_TEST_PLAIN'], 'harmless');
-  });
 
   it('puts oj first on PATH and forbids a git credential prompt', () => {
-    const env = withEnv({ GITHUB_TOKEN: token }, () => workerEnv(configWith([]), token, '/tmp/ojbin'));
+    const env = withEnv({ GITHUB_TOKEN: token }, () => workerEnv(config, token, '/tmp/ojbin'));
 
     assert.ok(env['PATH']?.startsWith('/tmp/ojbin:'));
     assert.equal(env['GIT_TERMINAL_PROMPT'], '0');
@@ -105,7 +84,7 @@ describe('workerEnv', () => {
   it('does not hand the worker its grandparent’s Claude Code session', () => {
     const env = withEnv(
       { GITHUB_TOKEN: token, CLAUDE_CODE_SESSION_ID: 'parent-session', CLAUDE_CONFIG_DIR: '/etc/claude' },
-      () => workerEnv(configWith([]), token, '/tmp/bin'),
+      () => workerEnv(config, token, '/tmp/bin'),
     );
 
     assert.equal(env['CLAUDE_CODE_SESSION_ID'], undefined);

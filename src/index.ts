@@ -1,6 +1,6 @@
 
 import { mkdirSync } from 'node:fs';
-import { loadAuthEnv, loadConfig, type OjConfig, type RepoConfig } from './config.js';
+import { GITHUB_API, loadAuthEnv, loadConfig, type RepoConfig } from './config.js';
 import type { DeskGateway } from './desk.js';
 import {
   createAuth,
@@ -10,6 +10,7 @@ import {
   type ReviewEvent,
 } from './github.js';
 import {
+  ACKNOWLEDGEMENT,
   decideEvent,
   failureComment,
   rateLimitedComment,
@@ -21,7 +22,7 @@ import { prKey, StateStore } from './state.js';
 import { removeWorkerDir, runReview, workerDirFor } from './worker.js';
 
 const config = loadConfig();
-const client = new GitHubClient(createAuth(loadAuthEnv(), config.github.apiBaseUrl), config.github.apiBaseUrl);
+const client = new GitHubClient(createAuth(loadAuthEnv()), GITHUB_API);
 const state = new StateStore(config.paths.stateFile);
 
 mkdirSync(config.paths.workersRoot, { recursive: true, mode: 0o700 });
@@ -49,10 +50,10 @@ type QueuedReview = {
 // ── deciding ─────────────────────────────────────────────────────────────────
 
 function decide(repo: RepoConfig, pull: PullRequest, baseline: number): Trigger | null {
-  if (pull.labels.includes(repo.reviewLabel)) return 'label';
+  if (pull.labels.includes(config.label)) return 'label';
   const existing = state.get(repo.slug, pull.number);
   if (existing?.retryAfter && Date.now() >= existing.retryAfter) return 'retry';
-  if (!repo.reviewNewPrs) return null;
+  if (!config.reviewNewPrs) return null;
   if (pull.number <= baseline) return null;
   // A prior record means the "new PR" trigger already fired; further rounds come from the label.
   if (existing) return null;
@@ -61,14 +62,11 @@ function decide(repo: RepoConfig, pull: PullRequest, baseline: number): Trigger 
 
 /** Reasons to decline a PR outright, with something to say to the humans. */
 function declineReason(repo: RepoConfig, pull: PullRequest): string | null {
-  if (pull.draft && !repo.reviewDrafts) {
-    return 'this pull request is a draft, and OJ is configured to skip drafts (`reviewDrafts: false`).';
-  }
-  if (pull.fromFork && !repo.reviewForks) {
+  if (pull.draft) return 'this pull request is a draft; mark it ready for review and re-label it.';
+  if (pull.fromFork) {
     return (
       `the head branch lives in a fork (\`${pull.headRepoSlug}\`), and OJ is configured ` +
-      'to skip fork pull requests (`reviewForks: false`). Reviewing one means cloning ' +
-      'outside code onto the review host, so it is opt-in.'
+      'OJ does not review pull requests from forks: the reviewer runs the head in its own checkout.'
     );
   }
   return null;
@@ -127,7 +125,7 @@ async function review(queued: QueuedReview): Promise<void> {
 
   if (trigger === 'label') {
     try {
-      await client.removeLabel(repo.owner, repo.repo, pull.number, repo.reviewLabel);
+      await client.removeLabel(repo.owner, repo.repo, pull.number, config.label);
     } catch (error) {
       warn(`${key}: could not remove the trigger label — ${String(error)}`);
     }
@@ -138,7 +136,7 @@ async function review(queued: QueuedReview): Promise<void> {
       repo.owner,
       repo.repo,
       pull.number,
-      config.review.acknowledgement.replace('{pr}', String(pull.number)),
+      ACKNOWLEDGEMENT,
     );
   } catch (error) {
     warn(`${key}: could not post the acknowledgement — ${String(error)}`);
@@ -183,7 +181,7 @@ async function review(queued: QueuedReview): Promise<void> {
         pull.number,
         outcome.reason === 'rate-limited'
           ? rateLimitedComment(outcome.retryAfter)
-          : failureComment(outcome.reason, outcome.detail, repo.reviewLabel),
+          : failureComment(outcome.reason, outcome.detail, config.label),
       );
     } catch (error) {
       warn(`${key}: could not report the failure either — ${String(error)}`);
@@ -192,7 +190,7 @@ async function review(queued: QueuedReview): Promise<void> {
   }
 
   const { ledger } = outcome;
-  const decision = decideEvent(ledger.verdict, repo, pull, identity);
+  const decision = decideEvent(ledger.verdict, config.approve, pull, identity);
 
   let postedEvent: ReviewEvent | null = null;
   if (decision.event !== 'COMMENT') {
@@ -293,7 +291,7 @@ async function tick(): Promise<void> {
       if (declined) {
         if (trigger === 'label') {
           try {
-            await client.removeLabel(repo.owner, repo.repo, pull.number, repo.reviewLabel);
+            await client.removeLabel(repo.owner, repo.repo, pull.number, config.label);
             await client.createIssueComment(
               repo.owner,
               repo.repo,
@@ -331,21 +329,10 @@ async function main(): Promise<void> {
   log(
     `starting — pid ${process.pid}, ${client.describeAuth()}` +
       (identity ? ` as ${identity}` : '') +
-      `, ${config.repos.length} repo(s), poll ${config.pollIntervalSeconds}s, ` +
-      `verdictMode ${config.verdictMode}`,
+      `, poll ${config.pollIntervalSeconds}s, label "${config.label}", newPrs=${config.reviewNewPrs}, ` +
+      `approve=${config.approve}: ${config.repos.map((repo) => repo.slug).join(', ')}`,
   );
-  for (const repo of config.repos) {
-    log(
-      `  ${repo.slug}: label "${repo.reviewLabel}", newPrs=${repo.reviewNewPrs}, ` +
-        `forks=${repo.reviewForks}, drafts=${repo.reviewDrafts}, verdict=${repo.verdictMode}`,
-    );
-  }
-  if (config.verdictMode === 'comment') {
-    log(
-      'verdictMode is "comment": every review posts as a COMMENT regardless of findings. ' +
-        'Set verdictMode: full once you trust it.',
-    );
-  }
+  if (!config.approve) log('approve is false: every review posts as a COMMENT regardless of findings.');
 
   // Sequential ticks rather than setInterval.
   while (!stopping) {

@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
-import type { OjConfig, RepoConfig } from './config.js';
+import { GITHUB_GIT, type OjConfig, type RepoConfig } from './config.js';
 import {
   clipBody,
   Desk,
@@ -256,7 +256,7 @@ export async function prepareClone(request: ReviewRequest): Promise<CloneResult>
       if (init.code !== 0) throw new Error(`git init failed: ${init.stderr.trim()}`);
     }
 
-    const remoteUrl = `${config.github.gitBaseUrl}/${repo.slug}.git`;
+    const remoteUrl = `${GITHUB_GIT}/${repo.slug}.git`;
     // `x-access-token` is the fixed username for both App installation tokens
     // and PATs over HTTPS. Not a secret; the password is the credential.
     const authedUrl = remoteUrl.replace('://', '://x-access-token@');
@@ -518,7 +518,6 @@ export function workerEnv(config: OjConfig, gitToken: string, binDir: string): N
     'XDG_CACHE_HOME',
     'XDG_DATA_HOME',
     ...PROXY_VARS,
-    ...config.worker.envPassthrough,
   ];
 
   const env: NodeJS.ProcessEnv = {};
@@ -966,6 +965,9 @@ function spawnClaude(
   });
 }
 
+const MAX_COMMENTS_PER_ROUND = 10;
+const MAX_ISSUES_PER_ROUND = 5;
+
 export async function runReview(request: ReviewRequest, previousSha: string | null): Promise<WorkerOutcome> {
   const startedAt = Date.now();
   const workerDir = workerDirFor(request.config, request.repo.slug, request.pull.number);
@@ -996,14 +998,14 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
     ? buildKickoff(request, clone, measurements)
     : buildFollowUp(request, clone, previousSha, measurements);
   writeFileSync(join(workerDir, 'oj', `kickoff-round-${request.round}.md`), prompt);
-  const footer = commentFooter(request.round, request.pull.headSha, request.repo.verdictMode);
+  const footer = commentFooter(request.round, request.pull.headSha, request.config.approve);
   const desk = new Desk({
     workerDir,
     gateway: request.gateway,
     footer,
     postedMarker,
-    maxComments: request.config.review.maxCommentsPerRound,
-    maxIssues: request.config.review.maxIssuesPerRound,
+    maxComments: MAX_COMMENTS_PER_ROUND,
+    maxIssues: MAX_ISSUES_PER_ROUND,
     onLog: (line) => request.onProgress?.(line),
   });
   ledger = desk.ledger;

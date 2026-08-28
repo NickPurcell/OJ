@@ -1,14 +1,11 @@
 # OJO configuration. Every key is read by src/config.ts.
 
 pollIntervalSeconds: 60
-# comment: every review posts as a COMMENT, whatever the verdict. full: clean → APPROVE,
-# blocking → REQUEST_CHANGES, subject to the per-repo switches under defaults/repos.
-verdictMode: full
 maxConcurrentReviews: 2
-
-github:
-  apiBaseUrl: https://api.github.com
-  gitBaseUrl: https://github.com
+label: "oj:review"
+reviewNewPrs: true
+# false: every review posts as a COMMENT. true: clean → APPROVE, blocking → REQUEST_CHANGES.
+approve: true
 
 paths:
   workersRoot: /var/lib/oj/workers
@@ -21,8 +18,6 @@ worker:
   model: ""
   timeoutMinutes: 45
   fetchDepth: 100
-  # Extra environment variables the reviewer may inherit. Nothing here may hold a credential.
-  envPassthrough: []
   # Deleted from the checkout before the reviewer sees it: files that would otherwise read as
   # instructions. The watched repo's OJ.md reaches the reviewer from the base branch instead.
   stripPaths:
@@ -38,24 +33,6 @@ worker:
     - .cursor
     - .windsurfrules
     - .github/copilot-instructions.md
-
-review:
-  acknowledgement: >-
-    🧬 OJ is reviewing this pull request. I will post findings here when the
-    sweep finishes — if nothing appears within the hour, something broke on my
-    end.
-  maxCommentsPerRound: 10
-  maxIssuesPerRound: 5
-
-# Policy every repo inherits; a repos entry may override any of these.
-defaults:
-  reviewLabel: "oj:review"
-  reviewNewPrs: true
-  reviewDrafts: false
-  # A fork's head runs in the reviewer's checkout; off unless you trust every forker.
-  reviewForks: false
-  approveWhenClean: true
-  requestChangesWhenBlocking: true
 
 repos:
   - NickPurcell/OJ
