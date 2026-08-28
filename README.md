@@ -216,7 +216,8 @@ setting you must turn on before that is safe.
 | File | Holds | Committed |
 |---|---|---|
 | `oj-config.yaml` | Watched repos, poll interval, labels, verdict mode, paths, per-round caps | yes |
-| `OJ.md` | The kickoff prompt every worker receives — the product | yes |
+| `prompts/kickoff.md` | The kickoff prompt every worker receives — the product | yes |
+| `OJ.md` | This repository's own review instructions, read from its base branch like any watched repo's | yes |
 | `prompts/worker-system-prompt.md` | Standing rules that survive compaction | yes |
 | `.env` | GitHub App key path or PAT | **no** |
 | `<watched repo>/OJ.md` | That repo's own review instructions, read from its base branch | yes, there |

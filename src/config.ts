@@ -173,7 +173,7 @@ const DEFAULTS = {
   },
   paths: {
     workersRoot: '/var/lib/oj/workers',
-    kickoffPrompt: 'OJ.md',
+    kickoffPrompt: 'prompts/kickoff.md',
     systemPrompt: 'prompts/worker-system-prompt.md',
     stateFile: '/var/lib/oj/state.json',
   },
@@ -454,7 +454,7 @@ export function loadConfig(configPath?: string): OjConfig {
     if (!existsSync(promptPath)) {
       throw new Error(
         `Prompt file not found: ${promptPath}. ` +
-          'OJ.md and prompts/worker-system-prompt.md ship with this repo — check ' +
+          'prompts/kickoff.md and prompts/worker-system-prompt.md ship with this repo — check ' +
           'paths.kickoffPrompt / paths.systemPrompt, or the service working directory.',
       );
     }
