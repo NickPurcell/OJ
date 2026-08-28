@@ -1,27 +1,11 @@
-# No trailing slash, deliberately. `node_modules/` matches a directory only, so
-# a *symlink* named node_modules — which is how a git worktree borrows the real
-# tree's install — slips past it and gets committed. That happened on
-# 2026-08-16: the branch carried a symlink whose content was an absolute path on
-# one machine, pointing at itself once checked out there, and every `tsc` after
-# that died with "too many levels of symbolic links". `npm run build` exits 216
-# and prints NOTHING, so the suite silently ran against a stale `dist/`.
+# No trailing slash: a symlink named node_modules must be ignored too.
 node_modules
 dist/
-
-# Carries the GitHub credential. The negation keeps the template tracked —
-# without it, adding .env.* silently untracks the one file here meant to be
-# committed.
 .env
 .env.*
 !.env.example
 *.log
-
-# The GitHub App private key. It signs the JWT that mints installation tokens,
-# so a copy in the tree is a copy of every permission the app has.
 *.pem
 *.private-key.pem
-
-# Local state, if you point paths.stateFile at the working directory rather
-# than /var/lib/oj while developing.
 state.json
 workers/

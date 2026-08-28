@@ -1,10 +1,4 @@
-/**
- * What a verdict is allowed to become.
- *
- * The one rule here that is not a preference: a missing verdict never approves.
- * A worker can fail to run `oj verdict` for a dozen boring reasons, and every
- * one of them must land on COMMENT.
- */
+/** What a verdict is allowed to become. */
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';

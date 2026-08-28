@@ -1,16 +1,3 @@
-/**
- * What OJO remembers between ticks, and across restarts.
- *
- * Small enough to be a JSON file rather than a database. The whole state is a
- * few hundred bytes per open PR, it is written a handful of times a minute,
- * and — importantly — a human debugging a stuck review should be able to `cat`
- * it. SQLite would buy durability guarantees that do not matter here, because
- * everything in this file is reconstructible: worst case OJO forgets a session
- * and starts a fresh one, which costs a warm cache and nothing else.
- *
- * The one thing that would be genuinely bad to lose is `baselinePr`, and it is
- * called out below.
- */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -22,26 +9,14 @@ export type PrRecord = {
   workerDir: string;
   /** Deterministic per PR — see `sessionIdFor` in worker.ts. Stored for the log. */
   sessionId: string;
-  /** How many review rounds have run. Round 1 starts the session; later rounds resume it. */
   rounds: number;
-  /** Head SHA of the last completed review; the next round's diff starts here. */
   lastReviewedHeadSha: string | null;
-  /** Epoch ms after which a rate-limited round is retried without a re-label. */
   retryAfter: number | null;
   createdAt: number;
   lastActivityAt: number;
 };
 
 export type RepoRecord = {
-  /**
-   * The highest PR number that existed the first time OJO saw this repo.
-   *
-   * `reviewNewPrs` means "review PRs that open from now on", and without a
-   * baseline the first tick after enabling it would fan out across every open
-   * PR in the repo at once. Losing this value re-baselines to whatever is open
-   * now, which is a quiet non-event; losing it *and* having it default to zero
-   * would be forty simultaneous reviews.
-   */
   baselinePr: number;
   firstSeenAt: number;
 };
@@ -74,9 +49,6 @@ export class StateStore {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException)?.code;
       if (code !== 'ENOENT') {
-        // A corrupt state file is recoverable — everything in it can be
-        // rebuilt — but silently starting from empty would re-baseline every
-        // repo and, with reviewNewPrs on, review the world. Say it loudly.
         process.stderr.write(
           `[oj] state file at ${this.path} is unreadable (${String(error)}) — starting empty. ` +
             'reviewNewPrs will re-baseline against the currently open PRs.\n',
@@ -86,13 +58,7 @@ export class StateStore {
     }
   }
 
-  /**
-   * Write via a temp file and rename.
-   *
-   * Rename is atomic within a filesystem, so a crash mid-write leaves the old
-   * state intact rather than a truncated file that the next boot treats as
-   * corrupt — which, per the comment above, is the expensive kind of loss.
-   */
+  /** Write via a temp file and rename. */
   #write(): void {
     mkdirSync(dirname(this.path), { recursive: true });
     const tmp = `${this.path}.tmp`;
@@ -130,13 +96,7 @@ export class StateStore {
     return this.all().filter((record) => record.slug === slug);
   }
 
-  /**
-   * The baseline for `reviewNewPrs`, establishing it on first sight.
-   *
-   * `highestOpenPr` is what OJO can see right now. On a repo it has never
-   * watched, everything at or below that number is pre-existing and is left
-   * for a human to request with the label.
-   */
+  /** The baseline for `reviewNewPrs`, establishing it on first sight. */
   baselineFor(slug: string, highestOpenPr: number): number {
     const existing = this.#state.repos[slug];
     if (existing) return existing.baselinePr;

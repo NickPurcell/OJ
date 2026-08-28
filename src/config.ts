@@ -1,53 +1,20 @@
-/**
- * OJO's configuration: behaviour from `oj-config.yaml`, secrets from the
- * environment.
- *
- * The split is the same one Clawcius makes and for the same reason — changing
- * which repos are watched, or how a verdict maps onto a GitHub review, should
- * be a diff someone can read in a PR. Credentials must never be in that diff.
- *
- * Every YAML key is optional and falls back to a default below, with one
- * exception: `repos` must name at least one repository, because a reviewer
- * watching nothing is a service that looks healthy and does nothing.
- */
 
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse } from 'yaml';
 
-/**
- * How a verdict is allowed to reach GitHub.
- *
- * `comment` posts COMMENT reviews no matter what the worker concluded. It is
- * the default, and it should stay the default until an operator has read a
- * few dozen reviews and believes them: a bot that can APPROVE is a bot whose
- * mistakes land in the merge queue, and a bot that can REQUEST_CHANGES is a
- * bot that can block a release at 2am over a hallucinated null deref.
- *
- * `full` honours the mapping in `review` below. Turn it on deliberately.
- */
 export type VerdictMode = 'comment' | 'full';
 
 /** Per-repo knobs. Every one of these has a global default. */
 export type RepoPolicy = {
-  /** Adding this label to a PR asks for a review. OJO removes it when it starts. */
   reviewLabel: string;
   /** Review a PR the first time OJO sees it, without waiting for the label. */
   reviewNewPrs: boolean;
   /** Draft PRs are usually still being written. Off by default. */
   reviewDrafts: boolean;
-  /**
-   * Review PRs whose head lives in a fork.
-   *
-   * Safe by construction here — OJO fetches `refs/pull/<n>/head` from the base
-   * repo rather than adding the fork as a remote, and the worker never holds a
-   * credential — but it is still someone else's code being cloned onto your
-   * host, so it is a decision rather than a default.
-   */
+  /** Review PRs whose head lives in a fork. */
   reviewForks: boolean;
-  /** No blocking findings → post an APPROVE review. */
   approveWhenClean: boolean;
-  /** At least one blocking finding → post a REQUEST_CHANGES review. */
   requestChangesWhenBlocking: boolean;
   /** Overrides the global `verdictMode` for this repo. */
   verdictMode: VerdictMode;
@@ -61,15 +28,6 @@ export type RepoConfig = RepoPolicy & {
 };
 
 export type OjConfig = {
-  /**
-   * Seconds between polls of the GitHub API.
-   *
-   * Polling rather than webhooks because the host is behind NAT and has no
-   * inbound route. The cost is one `GET /repos/:o/:r/pulls` per repo per tick,
-   * which against the 5000/hour installation budget means even a 30s interval
-   * across ten repos uses under a quarter of it. See `github.ts` for what
-   * happens when that estimate turns out to be wrong.
-   */
   pollIntervalSeconds: number;
   /** Global ceiling on what a verdict may become. See `VerdictMode`. */
   verdictMode: VerdictMode;
@@ -90,63 +48,25 @@ export type OjConfig = {
     kickoffPrompt: string;
     /** Appended to Claude Code's own system prompt in every worker session. */
     systemPrompt: string;
-    /** Which PRs have workers, and what OJO has already reviewed. */
     stateFile: string;
   };
 
   worker: {
-    /** The `claude` binary. An absolute path, because systemd's PATH is minimal. */
     claudePath: string;
     /** Model alias or full name. Empty string means "whatever the CLI defaults to". */
     model: string;
-    /**
-     * Hard cap on a single review round. The process is killed at this point
-     * and the round reported as a failure rather than left to run forever.
-     */
     timeoutMinutes: number;
-    /**
-     * Commits fetched for the PR head and its base. Deep enough that the merge
-     * base is usually present; `worker.ts` deepens automatically when it is not.
-     */
+    /** Commits fetched for the PR head and its base. */
     fetchDepth: number;
-    /**
-     * Extra environment variables the worker is allowed to inherit.
-     *
-     * The worker's environment is built from an allowlist, not filtered by a
-     * denylist — see `worker.ts`. Anything you add here you are handing to a
-     * process that will read attacker-authored code, so add carefully.
-     */
+    /** Extra environment variables the worker is allowed to inherit. */
     envPassthrough: string[];
-    /**
-     * Paths deleted from the clone after checkout, and marked binary in
-     * `.git/info/attributes` so they do not surface through `git diff` either.
-     *
-     * These are the file names that agentic tools treat as instructions. A PR
-     * that adds one is a PR trying to write its own review.
-     */
     stripPaths: string[];
   };
 
   review: {
-    /** Posted as an issue comment the moment a round starts. `{pr}` is substituted. */
     acknowledgement: string;
-    /** Delete a worker directory after this many hours with no activity. 0 disables. */
     workerTtlHours: number;
-    /**
-     * Comments one round's worker may post through `oj comment`.
-     *
-     * A review is normally one comment. The ceiling exists because the worker
-     * reads attacker-authored code and an injected one should not be able to
-     * turn a pull request into a thousand-comment thread; it is deliberately
-     * well above what an honest review needs.
-     */
     maxCommentsPerRound: number;
-    /**
-     * Issues one round's worker may open through `oj issue`.
-     *
-     * Same reasoning, lower number: issues live outside the pull request and
-     * someone has to close them by hand.
-     */
     maxIssuesPerRound: number;
   };
 
@@ -263,14 +183,7 @@ function verdictMode(raw: unknown, path: string, fallback: VerdictMode): Verdict
   return raw;
 }
 
-/**
- * Read the per-repo policy block, inheriting anything it does not state.
- *
- * Used twice: once against the top-level `defaults:` mapping to build the
- * house policy, and once per repo entry to override it. Making inheritance a
- * single function is what keeps "the default default" and "this repo's
- * default" from drifting apart as knobs get added.
- */
+/** Read the per-repo policy block, inheriting anything it does not state. */
 function policy(raw: Record<string, unknown>, path: string, inherited: RepoPolicy): RepoPolicy {
   return {
     reviewLabel: str(raw['reviewLabel'], `${path}.reviewLabel`, inherited.reviewLabel),
@@ -291,14 +204,7 @@ function policy(raw: Record<string, unknown>, path: string, inherited: RepoPolic
   };
 }
 
-/**
- * `owner/repo`, or an entry that names them separately.
- *
- * The slug form is what people actually type, so it is supported first-class
- * rather than as a convenience — a config file full of `owner:`/`repo:` pairs
- * is harder to scan for "is this repo watched?", which is the only question
- * anyone ever asks of this list.
- */
+/** `owner/repo`, or an entry that names them separately. */
 function repoEntry(raw: unknown, index: number, inherited: RepoPolicy): RepoConfig {
   const path = `repos[${index}]`;
   if (typeof raw === 'string') {
@@ -477,14 +383,6 @@ export function loadConfig(configPath?: string): OjConfig {
   return config;
 }
 
-/**
- * Credentials and deployment identity, from the environment.
- *
- * Two ways to authenticate, one interface (see `github.ts`). The App path is
- * strongly preferred: its tokens expire in an hour, its permissions are
- * per-repository, and its actions show up as the app rather than as a human
- * who did not do them.
- */
 export type AuthEnv =
   | {
       kind: 'app';
@@ -504,9 +402,6 @@ export function loadAuthEnv(env: NodeJS.ProcessEnv = process.env): AuthEnv {
   const token = env['OJ_GITHUB_TOKEN']?.trim() ?? env['GITHUB_TOKEN']?.trim();
 
   if (appId || installationId || privateKeyPath) {
-    // Partial App config is a misconfiguration, never an intent to fall back.
-    // Silently using a PAT because someone typo'd the installation id is how
-    // you end up with reviews posted under a human's name for a month.
     const missing = [
       appId ? null : 'OJ_GITHUB_APP_ID',
       installationId ? null : 'OJ_GITHUB_INSTALLATION_ID',

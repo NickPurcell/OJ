@@ -1,11 +1,3 @@
-/**
- * The desk, without a network.
- *
- * Every test here fixtures `DeskGateway`, which is the seam that exists for
- * exactly this reason: the GitHub call is one function on an object, and the
- * rules worth testing — what a request may say, how many times it may say it,
- * what happens when GitHub says no — are all on this side of it.
- */
 
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -160,10 +152,6 @@ describe('the desk round trip', () => {
   });
 
   it('awaiting a drain means everything on disk has been served', async () => {
-    // Until 2026-08-16 a re-entrant drain returned immediately, so `stop()` —
-    // which is a `drain()` — could return having drained nothing while a slow
-    // POST was in flight. `worker.ts` then read an empty ledger and concluded
-    // the round had said nothing, with the comment about to land.
     const dir = workspace();
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => {
@@ -219,11 +207,6 @@ describe('the desk round trip', () => {
   });
 
   it('never runs two passes at once, even from the microtask after a pass', async () => {
-    // The window OJ found: `#pass()` nulls `#running` in a `.finally` one
-    // microtask before its promise resolves, so a continuation awaiting that
-    // promise — `runReview` doing `await desk.drain()` and falling into
-    // `desk.stop()` — arrived while a queued pass was still scheduled and
-    // unschedulable. Keyed on `#running` alone, both then ran.
     const dir = workspace();
     let inside = 0;
     let most = 0;
@@ -242,8 +225,7 @@ describe('the desk round trip', () => {
 
     submit(dir, { action: 'comment', body: 'one' });
     const first = desk.drain();
-    // Registered on the first pass BEFORE the queued continuation exists, so it
-    // runs first — this is the ordering that made two passes overlap.
+    // Registered on the first pass before the queued continuation exists, so it runs first.
     const sneak = first.then(() => desk.drain());
     const queued = desk.drain();
     // Written while the first pass is inside GitHub, so both later passes have

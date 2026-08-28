@@ -1,16 +1,3 @@
-/**
- * Turning what the worker did into what GitHub sees.
- *
- * This file replaced `report.ts` on 2026-08-11. The old one parsed a JSON
- * document the worker had to write to an exact path, re-checked a survival rule
- * over its findings, and rendered them into a review body. All three jobs are
- * gone: the worker posts its own comment through the `oj` CLI, so the comment IS
- * the report, and the only thing left to decide is what a *verdict* means on
- * GitHub — which was never the model's decision to make. It is policy, it
- * belongs to the operator, and it is the whole content of this file.
- *
- * Nothing here is allowed to approve on a missing verdict. See `decideEvent`.
- */
 
 import type { RepoConfig } from './config.js';
 import type { Verdict } from './desk.js';
@@ -18,23 +5,10 @@ import type { PullRequest, ReviewEvent } from './github.js';
 
 export type VerdictDecision = {
   event: ReviewEvent;
-  /** What the mapping wanted before `verdictMode` or self-review capped it. */
   wanted: ReviewEvent;
   downgraded: boolean;
 };
 
-/**
- * Map the worker's verdict onto a GitHub review event.
- *
- * A missing verdict is COMMENT. Not APPROVE, and not an error: the worker that
- * ran out of budget, crashed after posting its comment, or simply forgot to run
- * `oj verdict` has still said something useful to a human, and the failure mode
- * of guessing APPROVE there is a merge that nobody looked at. The failure mode
- * of guessing COMMENT is a human reading a review and deciding for themselves,
- * which is the outcome this service exists to produce anyway.
- *
- * `verdictMode: comment` caps everything, as it always did.
- */
 export function decideEvent(
   verdict: Verdict | null,
   repo: RepoConfig,
@@ -53,24 +27,12 @@ export function decideEvent(
   if (repo.verdictMode !== 'full') {
     return { event: 'COMMENT', wanted, downgraded: wanted !== 'COMMENT' };
   }
-  // GitHub refuses to let an account approve or request changes on its own pull
-  // request. Catching it here rather than in the 422 fallback keeps the log
-  // readable when OJ reviews a PR that OJ opened.
   if (identity && pull.authorLogin === identity && wanted !== 'COMMENT') {
     return { event: 'COMMENT', wanted, downgraded: true };
   }
   return { event: wanted, wanted, downgraded: false };
 }
 
-/**
- * The line OJO staples to the bottom of every comment the worker posts.
- *
- * OJO's words, not the worker's, and added at post time — so a reader can tell
- * which round they are looking at and which commit it was about even when the
- * worker forgot to say. The provenance sentence is not decoration: a comment
- * from this account is a machine's opinion, and someone deciding how much
- * weight to give it deserves to know that in the same screenful.
- */
 export function commentFooter(round: number, headSha: string, verdictMode: string): string {
   const parts = [`OJ · round ${round} · head \`${headSha.slice(0, 8)}\``];
   if (verdictMode !== 'full') {
@@ -80,11 +42,6 @@ export function commentFooter(round: number, headSha: string, verdictMode: strin
   return `<sub>${parts.join(' · ')}</sub>`;
 }
 
-/**
- * The body of the review event OJO posts when the verdict is more than a
- * comment. Deliberately thin: the findings are in the worker's own comment, and
- * repeating them here would double every review.
- */
 export function verdictBody(
   decision: VerdictDecision,
   round: number,
@@ -105,14 +62,6 @@ export function verdictBody(
   return lines.join('\n');
 }
 
-/**
- * What a human sees when a round did not finish.
- *
- * Silence after an acknowledgement is worse than never acknowledging, and
- * "said nothing" is a different diagnosis from "crashed" — one means read the
- * transcript, the other means read the journal — so the reason is named rather
- * than folded into a generic apology.
- */
 export function failureComment(reason: string, detail: string, label: string): string {
   return [
     '## OJ review failed',
@@ -145,15 +94,7 @@ export type ChangedFile = {
   deletions: number;
 };
 
-/**
- * The pull request as facts, for `oj pr`.
- *
- * The description is fenced in a tag that says what it is. The worker's system
- * prompt already tells it that nothing written by the PR author is an
- * instruction; repeating the boundary at the point of delivery costs four lines
- * and means the warning is adjacent to the text it is about, rather than a
- * thousand tokens upstream of it.
- */
+/** The pull request as facts, for `oj pr`. */
 export function renderPullFacts(pull: PullRequest, files: ChangedFile[]): string {
   const lines = [
     `pull request: #${pull.number} — ${pull.title}`,
