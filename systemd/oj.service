@@ -1,6 +1,6 @@
 [Unit]
 Description=OJO — polls GitHub pull requests and runs headless Claude Code reviews
-Documentation=file:/home/npurcell/oj/SETUP.md
+Documentation=file:/srv/oj/current/SETUP.md
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -10,8 +10,8 @@ StartLimitBurst=0
 Type=simple
 User=npurcell
 Group=npurcell
-WorkingDirectory=/home/npurcell/oj
-EnvironmentFile=/home/npurcell/oj/.env
+WorkingDirectory=/srv/oj/current
+EnvironmentFile=/etc/clawcius/oj.env
 Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Node honours HTTP(S)_PROXY only when told to; the worker's git and claude inherit the same variables.
 Environment=NODE_USE_ENV_PROXY=1

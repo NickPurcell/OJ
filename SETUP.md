@@ -43,14 +43,17 @@ OJ backdates `iat` by 60 s, so more than a minute of skew needs NTP fixed.
 
 ## Install
 
+On the Clawcius host, OJ is deployed by the same deployer as Clawcius: `sudo deploy oj`
+builds `origin/main` into `/srv/oj/releases/<sha>`, points `/srv/oj/current` at it, installs
+`systemd/oj.service` and restarts it. The unit runs from `/srv/oj/current` and reads
+`/etc/clawcius/oj.env`. State lives in `/var/lib/oj`.
+
+Elsewhere:
+
 ```sh
-git clone https://github.com/NickPurcell/OJ.git /home/npurcell/oj
-cd /home/npurcell/oj
-npm install
-npm run build   # OJO, and the oj CLI every worker is given
-npm test
+git clone https://github.com/NickPurcell/OJ.git && cd OJ
+npm install && npm run build && npm test
 sudo install -d -m 0750 -o npurcell -g npurcell /var/lib/oj
-cp .env.example .env && chmod 600 .env
 ```
 
 ## Configure
@@ -76,7 +79,7 @@ sudo systemctl enable --now oj
 journalctl -u oj -f
 ```
 
-The unit runs as `npurcell` from `/home/npurcell/oj`, reads `.env` there, and
+The unit runs as `npurcell` from `/srv/oj/current`, reads `/etc/clawcius/oj.env`, and
 sets `NODE_USE_ENV_PROXY=1` so Node honours a proxy.
 
 ## Branch protection
