@@ -12,10 +12,9 @@ User=npurcell
 Group=npurcell
 WorkingDirectory=/srv/oj/current
 EnvironmentFile=/etc/clawcius/oj.env
-Environment=PATH=/home/npurcell/.local/share/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Node honours HTTP(S)_PROXY only when told to; the worker's git and claude inherit the same variables.
 Environment=NODE_USE_ENV_PROXY=1
-ExecStart=/home/npurcell/.local/share/node/bin/node dist/index.js
+ExecStart=/usr/bin/node dist/index.js
 Restart=always
 RestartSec=10
 TimeoutStopSec=30
