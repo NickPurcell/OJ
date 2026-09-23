@@ -15,7 +15,7 @@ paths:
 
 worker:
   claudePath: /home/npurcell/.local/bin/claude
-  model: ""
+  model: claude-opus-5-5
   timeoutMinutes: 45
   fetchDepth: 100
   # Deleted from the checkout before the reviewer sees it: files that would otherwise read as
