@@ -10,9 +10,8 @@
   to an interactive `claude auth login`, which expires and then fails every round
   with nothing to say so until a pull request is labelled. Do not use
   `ANTHROPIC_API_KEY` instead: the token bills against the operator's
-  subscription, and a key bills at API rates. The token is valid for a year
-  (the one on the Clawcius host expires 2027-11-03); renew it with the same
-  command before then.
+  subscription, and a key bills at API rates. The token is valid for a year;
+  renew it with the same command before then.
 - Disk for the clones: one full checkout per open pull request under
   `/var/lib/oj/workers`.
 
@@ -144,8 +143,8 @@ proxy variables unless `NODE_USE_ENV_PROXY=1` is set; the unit sets it.
 installation's repository access.
 
 **"OJ could not log in"** on the PR, `auth-failed` in the journal: the worker's
-Claude credential was refused before the round started, and the CLI's own reason
-is quoted in both. Re-labelling will fail the same way. Check that
+Claude credential was refused, so the round could not run, and the CLI's own
+reason is quoted in both. Re-labelling will fail the same way. Check that
 `CLAUDE_CODE_OAUTH_TOKEN` is set in `/etc/clawcius/oj.env` and still valid; if it
 has expired, run `claude setup-token` as the service user, replace it, and
 restart `oj.service`. `claude -p "say ok"` as the service user, with that

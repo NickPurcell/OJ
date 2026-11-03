@@ -78,7 +78,7 @@ export function authFailedComment(detail: string): string {
   return [
     '## OJ could not log in',
     '',
-    'The reviewer’s Claude credential was refused, so the round never started. ' +
+    'The reviewer’s Claude credential was refused, so the round could not run. ' +
       'Re-adding the label will fail the same way until the credential on the OJ host is ' +
       'renewed; SETUP.md describes how.',
     '',
