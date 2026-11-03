@@ -23,6 +23,7 @@ import { deskPaths } from '../desk.js';
 import type { PullRequest } from '../github.js';
 import {
   createStreamMonitor,
+  failureFor,
   installOjCli,
   kickoffValues,
   render,
@@ -89,6 +90,22 @@ describe('workerEnv', () => {
 
     assert.equal(env['CLAUDE_CODE_SESSION_ID'], undefined);
     assert.equal(env['CLAUDE_CONFIG_DIR'], '/etc/claude');
+  });
+
+  it('passes the long-lived Claude login token through', () => {
+    const env = withEnv({ GITHUB_TOKEN: token, CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-test' }, () =>
+      workerEnv(config, token, '/tmp/bin'),
+    );
+
+    assert.equal(env['CLAUDE_CODE_OAUTH_TOKEN'], 'sk-ant-oat01-test');
+  });
+
+  it('still drops a passed-through Claude variable that carries the GitHub token', () => {
+    const env = withEnv({ GITHUB_TOKEN: token, CLAUDE_CODE_OAUTH_TOKEN: `x${token}x` }, () =>
+      workerEnv(config, token, '/tmp/bin'),
+    );
+
+    assert.equal(env['CLAUDE_CODE_OAUTH_TOKEN'], undefined);
   });
 });
 
@@ -284,6 +301,65 @@ describe('createStreamMonitor', () => {
       { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1700000000 } },
     ]);
     assert.equal(totals.rateLimitResetsAt, 1700000000);
+  });
+});
+
+describe('failureFor', () => {
+  type Outcome = Parameters<typeof failureFor>[0];
+  const exited = { code: 1, signal: null, timedOut: false, stderr: '' };
+
+  function outcomeOf(lines: unknown[], exit: Partial<Outcome> = {}): Outcome {
+    const monitor = createStreamMonitor(() => {});
+    for (const line of lines) monitor.handleLine(JSON.stringify(line));
+    monitor.finish();
+    return { ...exited, ...exit, ...monitor.totals };
+  }
+
+  const refused = (text: string, status: number | null): unknown[] => [
+    { type: 'system', subtype: 'init' },
+    { type: 'assistant', error: 'authentication_failed', message: { content: [{ type: 'text', text }] } },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      terminal_reason: 'api_error',
+      api_error_status: status,
+      result: text,
+      num_turns: 1,
+      total_cost_usd: 0,
+    },
+  ];
+
+  it('names an expired login, which carries no HTTP status', () => {
+    const text = 'Failed to authenticate: OAuth session expired and could not be refreshed';
+    const failure = failureFor(outcomeOf(refused(text, null)), 30);
+
+    assert.equal(failure.reason, 'auth-failed');
+    assert.ok(failure.detail.includes(text));
+  });
+
+  it('names a rejected token as a login failure whatever the exit code', () => {
+    const text = 'Failed to authenticate. API Error: 401 OAuth access token is invalid.';
+    const failure = failureFor(outcomeOf(refused(text, 401), { code: 0 }), 30);
+
+    assert.equal(failure.reason, 'auth-failed');
+    assert.equal(failure.retryAfter, null);
+  });
+
+  it('reports the result text of any other failed session instead of empty stderr', () => {
+    const text = 'API Error: 500 the server had a moment';
+    const lines = [{ type: 'result', subtype: 'success', is_error: true, result: text, num_turns: 1, total_cost_usd: 0 }];
+    const failure = failureFor(outcomeOf(lines), 30);
+
+    assert.equal(failure.reason, 'spawn-failed');
+    assert.ok(failure.detail.includes(text));
+  });
+
+  it('falls back to stderr when the session never produced a result', () => {
+    const failure = failureFor(outcomeOf([], { stderr: 'claude: command not found' }), 30);
+
+    assert.equal(failure.reason, 'spawn-failed');
+    assert.ok(failure.detail.includes('claude: command not found'));
   });
 });
 

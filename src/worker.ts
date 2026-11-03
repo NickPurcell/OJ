@@ -48,7 +48,13 @@ export function workerDirFor(config: OjConfig, slug: string, prNumber: number): 
   return join(config.paths.workersRoot, `${slug.replace(/\//g, '__')}__${prNumber}`);
 }
 
-export type WorkerFailure = 'clone-failed' | 'spawn-failed' | 'timeout' | 'said-nothing' | 'rate-limited';
+export type WorkerFailure =
+  | 'clone-failed'
+  | 'spawn-failed'
+  | 'auth-failed'
+  | 'timeout'
+  | 'said-nothing'
+  | 'rate-limited';
 
 export type WorkerOutcome =
   | {
@@ -533,6 +539,7 @@ export function workerEnv(config: OjConfig, gitToken: string, binDir: string): N
   // Claude Code's own variables are named individually, never taken by prefix.
   const CLAUDE_CONFIG_VARS = [
     'CLAUDE_CONFIG_DIR',
+    'CLAUDE_CODE_OAUTH_TOKEN',
     'CLAUDE_CODE_USE_BEDROCK',
     'CLAUDE_CODE_USE_VERTEX',
     'CLAUDE_CODE_SKIP_BEDROCK_AUTH',
@@ -570,15 +577,15 @@ export function workerEnv(config: OjConfig, gitToken: string, binDir: string): N
   return env;
 }
 
-type SpawnOutcome = {
+type ProcessExit = {
   code: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
   stderr: string;
-  costUsd: number;
-  turns: number;
-  rateLimitResetsAt: number | null;
 };
+
+/** How the process ended, with everything the stream reported along the way. */
+export type SpawnOutcome = ProcessExit & StreamTotals;
 
 function workerPermissionSettings(binDir: string): string {
   return JSON.stringify({
@@ -666,6 +673,10 @@ export type StreamTotals = {
   results: number;
   /** Epoch seconds at which a rejected rate limit resets, if one was hit. */
   rateLimitResetsAt: number | null;
+  /** The `error` kind the API attached to an assistant message, e.g. `authentication_failed`. */
+  apiError: string | null;
+  /** The `result` text of the last result message flagged `is_error`. */
+  errorResult: string | null;
 };
 
 export type StreamMonitor = {
@@ -676,13 +687,21 @@ export type StreamMonitor = {
 };
 
 export function createStreamMonitor(onProgress: (line: string) => void): StreamMonitor {
-  const totals: StreamTotals = { costUsd: 0, turns: 0, results: 0, rateLimitResetsAt: null };
+  const totals: StreamTotals = {
+    costUsd: 0,
+    turns: 0,
+    results: 0,
+    rateLimitResetsAt: null,
+    apiError: null,
+    errorResult: null,
+  };
   const open = new Map<string, { seq: number; name: string; arguments: string; startedAt: number }>();
   const seenSystemSubtypes = new Set<string>();
   let calls = 0;
   let lastMessageAt = Date.now();
 
   const handleAssistant = (message: Record<string, unknown>): void => {
+    if (typeof message['error'] === 'string') totals.apiError = message['error'];
     const content = (message['message'] as { content?: unknown[] } | undefined)?.content ?? [];
     const sub = message['parent_tool_use_id'] ? ' (subagent)' : '';
     for (const block of content) {
@@ -752,6 +771,10 @@ export function createStreamMonitor(onProgress: (line: string) => void): StreamM
 
   const handleResult = (message: Record<string, unknown>, raw: string): void => {
     totals.results += 1;
+    // A failed session still reports `subtype: success`; `is_error` is what says it failed.
+    if (message['is_error'] === true && typeof message['result'] === 'string') {
+      totals.errorResult = message['result'];
+    }
     const turns = Number(message['num_turns']);
     const cost = Number(message['total_cost_usd']);
     const carriesUsage = Number.isFinite(turns) && Number.isFinite(cost);
@@ -891,14 +914,14 @@ function spawnClaude(
     let settled = false;
     const monitor = createStreamMonitor((line) => request.onProgress?.(line));
 
-    const finish = (outcome: SpawnOutcome): void => {
+    const finish = (exit: ProcessExit): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       // The post-mortem belongs to every exit, including the ones where the
       // process had to be killed — those are the rounds it explains.
       monitor.finish();
-      resolve(outcome);
+      resolve({ ...exit, ...monitor.totals });
     };
 
     const timer = setTimeout(
@@ -916,9 +939,6 @@ function spawnClaude(
               signal: 'SIGKILL',
               timedOut: true,
               stderr: `${stderr}\nworker did not exit after SIGKILL; abandoned`,
-              costUsd: monitor.totals.costUsd,
-              turns: monitor.totals.turns,
-              rateLimitResetsAt: monitor.totals.rateLimitResetsAt,
             }),
           15_000,
         ).unref();
@@ -945,9 +965,6 @@ function spawnClaude(
         signal: null,
         timedOut,
         stderr: `${stderr}\n${error.message}`,
-        costUsd: monitor.totals.costUsd,
-        turns: monitor.totals.turns,
-        rateLimitResetsAt: monitor.totals.rateLimitResetsAt,
       });
     });
 
@@ -957,9 +974,6 @@ function spawnClaude(
         signal,
         timedOut,
         stderr,
-        costUsd: monitor.totals.costUsd,
-        turns: monitor.totals.turns,
-        rateLimitResetsAt: monitor.totals.rateLimitResetsAt,
       });
     });
   });
@@ -1019,38 +1033,8 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
   }
   const durationMs = Date.now() - startedAt;
   if (ledger.comments.length === 0) {
-    const failure = (
-      reason: WorkerFailure,
-      detail: string,
-      retryAfter: number | null = null,
-    ): WorkerOutcome => ({ ok: false, reason, detail, workerDir, durationMs, ledger, retryAfter });
-    if (outcome.timedOut) {
-      return failure(
-        'timeout',
-        `the worker exceeded ${request.config.worker.timeoutMinutes} minutes and was killed before ` +
-          'it posted anything. The session is intact, so re-labelling the PR resumes it rather than ' +
-          'starting over.',
-      );
-    }
-    if (outcome.code === 0) {
-      return failure(
-        'said-nothing',
-        'the worker finished without posting a comment, even after being told to at the end of its ' +
-          'turn. Its findings, if any, are in the session; re-labelling the PR resumes it.',
-      );
-    }
-    if (outcome.rateLimitResetsAt !== null) {
-      const resetsAt = outcome.rateLimitResetsAt * 1000;
-      return failure(
-        'rate-limited',
-        `the API rate limit was hit before anything was posted; it resets at ${new Date(resetsAt).toISOString()}.`,
-        resetsAt + 60_000,
-      );
-    }
-    return failure(
-      'spawn-failed',
-      `claude exited ${outcome.code ?? outcome.signal}: ${outcome.stderr.trim().slice(0, 500)}`,
-    );
+    const { reason, detail, retryAfter } = failureFor(outcome, request.config.worker.timeoutMinutes);
+    return { ok: false, reason, detail, workerDir, durationMs, ledger, retryAfter };
   }
   const caveats: string[] = [];
   if (outcome.timedOut) caveats.push('the worker was killed by the round timeout after posting');
@@ -1066,6 +1050,56 @@ export async function runReview(request: ReviewRequest, previousSha: string | nu
     costUsd: outcome.costUsd,
     turns: outcome.turns,
     caveat: caveats.join('; '),
+  };
+}
+
+/** Why a worker that posted nothing failed, and when OJO may retry it by itself. */
+export function failureFor(
+  outcome: SpawnOutcome,
+  timeoutMinutes: number,
+): { reason: WorkerFailure; detail: string; retryAfter: number | null } {
+  if (outcome.timedOut) {
+    return {
+      reason: 'timeout',
+      detail:
+        `the worker exceeded ${timeoutMinutes} minutes and was killed before ` +
+        'it posted anything. The session is intact, so re-labelling the PR resumes it rather than ' +
+        'starting over.',
+      retryAfter: null,
+    };
+  }
+  // Checked before the exit code: a refused credential means the worker never ran,
+  // whatever the process returned.
+  if (outcome.apiError === 'authentication_failed') {
+    return {
+      reason: 'auth-failed',
+      detail: outcome.errorResult ?? 'the API refused the worker’s Claude credential',
+      retryAfter: null,
+    };
+  }
+  if (outcome.code === 0) {
+    return {
+      reason: 'said-nothing',
+      detail:
+        'the worker finished without posting a comment, even after being told to at the end of its ' +
+        'turn. Its findings, if any, are in the session; re-labelling the PR resumes it.',
+      retryAfter: null,
+    };
+  }
+  if (outcome.rateLimitResetsAt !== null) {
+    const resetsAt = outcome.rateLimitResetsAt * 1000;
+    return {
+      reason: 'rate-limited',
+      detail: `the API rate limit was hit before anything was posted; it resets at ${new Date(resetsAt).toISOString()}.`,
+      retryAfter: resetsAt + 60_000,
+    };
+  }
+  // The CLI reports API failures in its result message, not on stderr.
+  const said = outcome.errorResult ?? outcome.stderr;
+  return {
+    reason: 'spawn-failed',
+    detail: `claude exited ${outcome.code ?? outcome.signal}: ${said.trim().slice(0, 500)}`,
+    retryAfter: null,
   };
 }
 

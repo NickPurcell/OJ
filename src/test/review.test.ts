@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { Verdict } from '../desk.js';
 import type { PullRequest } from '../github.js';
-import { commentFooter, decideEvent } from '../review.js';
+import { authFailedComment, commentFooter, decideEvent } from '../review.js';
 
 const pull = { number: 7, authorLogin: 'someone', headSha: 'abcdef1234' } as PullRequest;
 
@@ -41,5 +41,13 @@ describe('commentFooter', () => {
     assert.match(commentFooter(3, 'abcdef1234567890', true), /round 3.*abcdef12/);
     assert.doesNotMatch(commentFooter(3, 'abcdef1234567890', true), /cannot approve/);
     assert.match(commentFooter(1, 'abcdef1234567890', false), /cannot approve or block/);
+  });
+});
+
+describe('authFailedComment', () => {
+  it('carries what the CLI said about the refusal', () => {
+    const said = 'Failed to authenticate: OAuth session expired and could not be refreshed';
+
+    assert.ok(authFailedComment(said).includes(said));
   });
 });

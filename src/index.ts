@@ -11,6 +11,7 @@ import {
 } from './github.js';
 import {
   ACKNOWLEDGEMENT,
+  authFailedComment,
   decideEvent,
   failureComment,
   rateLimitedComment,
@@ -181,7 +182,9 @@ async function review(queued: QueuedReview): Promise<void> {
         pull.number,
         outcome.reason === 'rate-limited'
           ? rateLimitedComment(outcome.retryAfter)
-          : failureComment(outcome.reason, outcome.detail, config.label),
+          : outcome.reason === 'auth-failed'
+            ? authFailedComment(outcome.detail)
+            : failureComment(outcome.reason, outcome.detail, config.label),
       );
     } catch (error) {
       warn(`${key}: could not report the failure either — ${String(error)}`);
