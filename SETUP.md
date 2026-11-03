@@ -2,10 +2,16 @@
 
 ## Prerequisites
 
-- **Node 22+**, **git**, and the **`claude` CLI** logged in as the user the
-  service runs as (`claude auth`). Workers inherit that login; a user who has
-  never run `claude` produces workers that fail on authentication, which shows
-  up as every review timing out.
+- **Node 22+**, **git**, and the **`claude` CLI** installed for the user the
+  service runs as.
+- **A Claude credential for the workers, from `claude setup-token`.** Run it once
+  as that user and put the token in `/etc/clawcius/oj.env` as
+  `CLAUDE_CODE_OAUTH_TOKEN`; `workerEnv` passes it to every worker. Prefer this
+  to an interactive `claude auth login`, which expires and then fails every round
+  with nothing to say so until a pull request is labelled. Do not use
+  `ANTHROPIC_API_KEY` instead: the token bills against the operator's
+  subscription, and a key bills at API rates. The token is valid for a year;
+  renew it with the same command before then.
 - Disk for the clones: one full checkout per open pull request under
   `/var/lib/oj/workers`.
 
@@ -136,8 +142,13 @@ proxy variables unless `NODE_USE_ENV_PROXY=1` is set; the unit sets it.
 **403 with rate-limit budget remaining** is a permissions problem: check the
 installation's repository access.
 
-**Every review times out** with no `tool …` lines in the journal: Anthropic
-auth. Run `claude -p "say ok"` as the service user.
+**"OJ could not log in"** on the PR, `auth-failed` in the journal: the worker's
+Claude credential was refused, so the round could not run, and the CLI's own
+reason is quoted in both. Re-labelling will fail the same way. Check that
+`CLAUDE_CODE_OAUTH_TOKEN` is set in `/etc/clawcius/oj.env` and still valid; if it
+has expired, run `claude setup-token` as the service user, replace it, and
+restart `oj.service`. `claude -p "say ok"` as the service user, with that
+variable exported, reproduces the failure outside OJ.
 
 **`said-nothing`.** The session ended without `oj comment`, even after the Stop
 hook told it to post. Read `oj/kickoff-round-N.md` and the transcript. `oj

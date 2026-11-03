@@ -73,6 +73,21 @@ export function failureComment(reason: string, detail: string, label: string): s
   ].join('\n');
 }
 
+/** The worker's Claude credential was refused, so re-labelling alone cannot help. */
+export function authFailedComment(detail: string): string {
+  return [
+    '## OJ could not log in',
+    '',
+    'The reviewer’s Claude credential was refused, so the round could not run. ' +
+      'Re-adding the label will fail the same way until the credential on the OJ host is ' +
+      'renewed; SETUP.md describes how.',
+    '',
+    '```',
+    detail.slice(0, 1500),
+    '```',
+  ].join('\n');
+}
+
 // ── What `oj pr` and `oj comments` print ─────────────────────────────────────
 
 export function rateLimitedComment(retryAfter: number | null): string {

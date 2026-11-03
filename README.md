@@ -70,8 +70,9 @@ each earlier finding whether it was fixed, answered with prose, or is still open
 
 **Posts or fails.** A Claude Code Stop hook refuses the first attempt to end a
 round without a posted review. A round that still posts nothing fails on the
-pull request with a reason (`timeout`, `said-nothing`, `spawn-failed`); a round
-that hit the API rate limit retries by itself after the reset.
+pull request with a reason (`clone-failed`, `timeout`, `said-nothing`,
+`spawn-failed`, `auth-failed`); a round that hit the API rate limit retries by
+itself after the reset.
 
 **Files what is out of scope** as issues, as it goes. **Cleans up** the
 directory when the PR closes.
